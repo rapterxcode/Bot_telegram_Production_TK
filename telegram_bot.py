@@ -35,8 +35,11 @@ class TelegramMemberBot:
         # เก็บข้อมูล invite links ที่สร้าง (ชั่วคราวในหน่วยความจำ)
         self.invite_link_expires = {}  # {invite_link: expire_days}
         
-        # เก็บข้อมูลประเภทการเข้าร่วมล่าสุด (สำหรับกำหนดประเภทสมาชิกใหม่)
-        self.recent_join_type = "default"  # default, 1month, 1year, noexpire
+        # เก็บข้อมูลประเภทการเข้าร่วมล่าสุด (สำหรับกำหนดประเภทสมาชิกใหม่) - เลิกใช้แล้ว
+        self.recent_join_type = "default"  # deprecated - ใช้ invite_link_expires แทน
+        
+        # เก็บ mapping ระหว่าง invite link กับข้อมูลการตั้งค่า
+        self.active_invite_links = {}  # {link_url: {type, days, period_name}}
         
         # เก็บข้อมูลสมาชิกที่รออนุมัติ {user_id: {username, first_name, last_name, join_type, expire_date_str, timestamp}}
         self.pending_members = {}
@@ -446,13 +449,23 @@ class TelegramMemberBot:
             )
             
             # เก็บข้อมูล invite link พร้อมประเภท
-            self.invite_link_expires[invite_link.invite_link] = {
+            link_url = invite_link.invite_link
+            self.invite_link_expires[link_url] = {
                 'days': days if days is not None else "no_expire",
                 'type': link_type,
                 'period_name': period_name,
                 'created_time': current_time,
                 'expire_time': link_expire_time
             }
+            
+            # เก็บใน active_invite_links สำหรับการค้นหาที่ง่ายขึ้น
+            self.active_invite_links[link_url] = {
+                'type': link_type,
+                'days': days if days is not None else "no_expire",
+                'period_name': period_name
+            }
+            
+            logger.info(f"📝 Stored invite link: {link_url} with type: {link_type}, days: {days}")
             
             # ทำความสะอาด invite links ที่หมดอายุแล้ว
             self._cleanup_expired_invite_links()
@@ -517,6 +530,8 @@ class TelegramMemberBot:
         # ลบ links ที่หมดอายุ
         for link in expired_links:
             del self.invite_link_expires[link]
+            if link in self.active_invite_links:
+                del self.active_invite_links[link]
             logger.info(f"🧹 Cleaned up expired invite link: {link}")
         
         if expired_links:
@@ -1289,16 +1304,62 @@ class TelegramMemberBot:
             
             current_time = datetime.now(pytz.timezone(config.TIMEZONE))
             
-            # หาข้อมูล invite link ที่ใช้จาก invite_link ใน join_request
-            invite_link_used = getattr(join_request, 'invite_link', None)
+            # หาข้อมูล invite link ที่ใช้จาก join_request
+            invite_link_used = None
             link_info = None
             join_type = "default"
             
-            if invite_link_used:
-                # ตรวจสอบใน invite_link_expires dictionary
-                link_info = self.invite_link_expires.get(invite_link_used)
-                logger.info(f"🔗 Invite link used: {invite_link_used}")
-                logger.info(f"📋 Link info found: {link_info}")
+            # ทำความสะอาด links ที่หมดอายุก่อน
+            self._cleanup_expired_invite_links()
+            
+            # ตรวจสอบ invite_link จาก join_request
+            if hasattr(join_request, 'invite_link') and join_request.invite_link:
+                if hasattr(join_request.invite_link, 'invite_link'):
+                    invite_link_used = join_request.invite_link.invite_link
+                else:
+                    invite_link_used = str(join_request.invite_link)
+                logger.info(f"🔗 Invite link found in join_request: {invite_link_used}")
+            else:
+                logger.info("📭 No invite_link found in join_request")
+            
+            # ตรวจสอบในรายการ invite links ทั้งหมด
+            active_links = list(self.active_invite_links.keys())
+            logger.info(f"📚 Available active invite links: {len(active_links)} links")
+            for link in active_links:
+                logger.info(f"   - {link}: {self.active_invite_links[link]}")
+            
+            # ลองหาจาก exact match ก่อน
+            if invite_link_used and invite_link_used in self.active_invite_links:
+                link_info = self.active_invite_links[invite_link_used]
+                logger.info(f"✅ Exact match found for {invite_link_used}: {link_info}")
+            
+            # หากไม่เจอให้ลองใช้ partial matching (เผื่อมี query parameters)
+            elif invite_link_used and not link_info:
+                for stored_link, stored_info in self.active_invite_links.items():
+                    if invite_link_used in stored_link or stored_link in invite_link_used:
+                        link_info = stored_info
+                        logger.info(f"🔍 Partial match found: {stored_link} matches {invite_link_used}")
+                        break
+            
+            # หากยังไม่เจอ ให้ใช้ link ที่สร้างล่าสุด (ภายใน 5 นาที)
+            if not link_info and self.invite_link_expires:
+                recent_threshold = current_time - timedelta(minutes=5)
+                recent_links = []
+                
+                for link, info in self.invite_link_expires.items():
+                    if info.get('created_time', current_time) > recent_threshold:
+                        recent_links.append((link, info))
+                
+                if recent_links:
+                    # เอา link ล่าสุด
+                    latest_link = max(recent_links, key=lambda x: x[1].get('created_time', current_time))
+                    link_info = {
+                        'type': latest_link[1]['type'],
+                        'days': latest_link[1]['days'],
+                        'period_name': latest_link[1]['period_name']
+                    }
+                    invite_link_used = latest_link[0]
+                    logger.info(f"🕐 Using recent link (within 5 min): {invite_link_used} with info: {link_info}")
             
             if link_info:
                 # ใช้ข้อมูลจาก invite link ที่ใช้จริง
@@ -1311,29 +1372,14 @@ class TelegramMemberBot:
                     default_expire = current_time + timedelta(days=days)
                     expire_date_str = default_expire.strftime('%Y-%m-%d %H:%M:%S')
                 
-                logger.info(f"✅ Using link info - Type: {join_type}, Days: {days}, Expire: {expire_date_str}")
+                logger.info(f"✅ Final result - Type: {join_type}, Days: {days}, Expire: {expire_date_str}")
             else:
-                # Fallback: ใช้วิธีเดิมสำหรับกรณีที่หา link info ไม่เจอ
-                if self.recent_join_type == "1month":
-                    expire_days = config.INVITE_LINK_1MONTH_DAYS 
-                    default_expire = current_time + timedelta(days=expire_days)
-                    expire_date_str = default_expire.strftime('%Y-%m-%d %H:%M:%S')
-                    join_type = self.recent_join_type
-                elif self.recent_join_type == "1year":
-                    expire_days = config.INVITE_LINK_1YEAR_DAYS
-                    default_expire = current_time + timedelta(days=expire_days)
-                    expire_date_str = default_expire.strftime('%Y-%m-%d %H:%M:%S')
-                    join_type = self.recent_join_type
-                elif self.recent_join_type == "noexpire":
-                    expire_date_str = config.INVITE_LINK_NOEXPIRE
-                    join_type = self.recent_join_type
-                else:
-                    # สำหรับการเข้าแบบปกติหรือ custom
-                    expire_days = config.DEFAULT_EXPIRE_DAYS
-                    default_expire = current_time + timedelta(days=expire_days)
-                    expire_date_str = default_expire.strftime('%Y-%m-%d %H:%M:%S')
+                # Fallback สุดท้าย: ใช้ค่า default
+                expire_days = config.DEFAULT_EXPIRE_DAYS
+                default_expire = current_time + timedelta(days=expire_days)
+                expire_date_str = default_expire.strftime('%Y-%m-%d %H:%M:%S')
                 
-                logger.info(f"⚙️ Using fallback - Type: {join_type}, Expire: {expire_date_str}")
+                logger.info(f"⚠️ Using default fallback - Type: {join_type}, Days: {expire_days}, Expire: {expire_date_str}")
             
             # เพิ่มใน pending list พร้อม join_request object
             self.pending_members[user_id] = {
