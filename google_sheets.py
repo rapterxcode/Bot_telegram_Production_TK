@@ -97,7 +97,7 @@ class GoogleSheetsManager:
                 if row_index <= len(values) and len(row) > user_id_col:
                     if row[user_id_col] == str(user_id):
                         # อัปเดต username
-                        cell_range = f"Sheet1!{chr(65 + username_col)}{row_index}"
+                        cell_range = f"{config.WORKSHEET_NAME}!{chr(65 + username_col)}{row_index}"
                         body = {'values': [[new_username]]}
                         
                         self.service.spreadsheets().values().update(
@@ -221,7 +221,7 @@ class GoogleSheetsManager:
             ]
             
             # เพิ่มข้อมูลในแถวใหม่
-            range_name = f"Sheet1!A{next_row}:F{next_row}"
+            range_name = f"{config.WORKSHEET_NAME}!A{next_row}:F{next_row}"
             body = {'values': [new_row]}
             
             self.service.spreadsheets().values().update(
