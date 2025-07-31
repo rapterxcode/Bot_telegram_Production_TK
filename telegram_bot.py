@@ -232,22 +232,22 @@ class TelegramMemberBot:
                     only_if_banned=True
                 )
                 
-                # เพิ่มสมาชิกโดยตรง
-                await context.bot.add_chat_member(
+                # สร้าง invite link ที่เพิ่มสมาชิกโดยตรง (ไม่ต้องอนุมัติ)
+                invite_link = await context.bot.create_chat_invite_link(
                     chat_id=target_group_id,
-                    user_id=int(member_user_id)
+                    member_limit=1,
+                    creates_join_request=False
                 )
                 
-                # ส่งข้อความต้อนรับให้ user
-                try:
-                    await context.bot.send_message(
-                        chat_id=int(member_user_id),
-                        text=f"🎉 ยินดีต้อนรับเข้าสู่กลุ่ม!\n"
-                             f"📅 หมดอายุสมาชิกภาพ: {expire_date}\n"
-                             f"📋 กรุณาปฏิบัติตามกฎของกลุ่ม"
-                    )
-                except:
-                    pass  # ไม่ต้องสนใจถ้าส่งข้อความไม่ได้
+                # ส่งลิงก์ให้สมาชิกเพื่อเข้ากลุ่ม
+                await context.bot.send_message(
+                    chat_id=int(member_user_id),
+                    text=f"🎉 คุณได้รับอนุมัติให้เข้าร่วมกลุ่ม!\n"
+                         f"📅 หมดอายุสมาชิกภาพ: {expire_date}\n"
+                         f"🔗 คลิกลิงก์เพื่อเข้าร่วม: {invite_link.invite_link}\n"
+                         f"📋 กรุณาปฏิบัติตามกฎของกลุ่ม"
+                )
+                
                 
             except Exception as e:
                 print(f"❌ ข้อผิดพลาดในการเพิ่มสมาชิกเข้ากลุ่ม: {e}")
@@ -268,12 +268,12 @@ class TelegramMemberBot:
                          f"👤 Username: {username}\n"
                          f"🆔 User ID: {member_user_id}\n"
                          f"📅 หมดอายุ: {expire_date}\n"
-                         f"📊 วิธีการ: เพิ่มโดยตรงเข้ากลุ่ม + บันทึกใน Google Sheet"
+                         f"📊 วิธีการ: ส่งลิงก์เชิญ + บันทึกใน Google Sheet"
                 )
             else:
                 await context.bot.send_message(
                     chat_id=admin_group_id,
-                    text="❌ เพิ่มสมาชิกเข้ากลุ่มสำเร็จ แต่ไม่สามารถบันทึกข้อมูลใน Google Sheet ได้"
+                    text="❌ ส่งลิงก์เชิญสำเร็จ แต่ไม่สามารถบันทึกข้อมูลใน Google Sheet ได้"
                 )
                 
         except Exception as e:
@@ -1110,45 +1110,93 @@ class TelegramMemberBot:
                     return f"User already in pending list: {user_id}"
                 
                 if not member_exists:
-                    # ไม่ auto-accept - ใส่ใน pending list สำหรับการอนุมัติ
-                    from datetime import datetime, timedelta
-                    import pytz
+                    # ตรวจสอบว่าเป็นการเพิ่มโดย admin หรือไม่
+                    added_by_admin = False
+                    if hasattr(chat_member_update, 'from_user') and chat_member_update.from_user:
+                        added_by_user_id = chat_member_update.from_user.id
+                        # ตรวจสอบว่าผู้เพิ่มเป็น admin หรือไม่
+                        if config.is_admin(added_by_user_id):
+                            added_by_admin = True
                     
-                    # ตั้งค่าวันหมดอายุตามประเภทการเข้าร่วมล่าสุด
-                    current_time = datetime.now(pytz.timezone(config.TIMEZONE))
-                    
-                    # กำหนดวันหมดอายุตามประเภท invite link ที่ใช้ล่าสุด
-                    if self.recent_join_type == "1month":
-                        expire_days = config.INVITE_LINK_1MONTH_DAYS
-                        default_expire = current_time + timedelta(days=expire_days)
-                        expire_date_str = default_expire.strftime('%Y-%m-%d %H:%M:%S')
-                    elif self.recent_join_type == "1year":
-                        expire_days = config.INVITE_LINK_1YEAR_DAYS
-                        default_expire = current_time + timedelta(days=expire_days)
-                        expire_date_str = default_expire.strftime('%Y-%m-%d %H:%M:%S')
-                    elif self.recent_join_type == "noexpire":
-                        expire_date_str = config.INVITE_LINK_NOEXPIRE
-                    else:
-                        # สำหรับการเข้าแบบปกติหรือ custom
+                    if added_by_admin:
+                        # เพิ่มโดย admin - เพิ่มเข้า Google Sheet โดยตรงด้วยอายุ default
+                        from datetime import datetime, timedelta
+                        import pytz
+                        
+                        current_time = datetime.now(pytz.timezone(config.TIMEZONE))
                         expire_days = config.DEFAULT_EXPIRE_DAYS
                         default_expire = current_time + timedelta(days=expire_days)
                         expire_date_str = default_expire.strftime('%Y-%m-%d %H:%M:%S')
+                        
+                        # เพิ่มเข้า Google Sheet ทันที
+                        success = self.sheets_manager.add_member_with_details(
+                            username, user_id, expire_date_str, first_name, last_name
+                        )
+                        
+                        if success:
+                            # แจ้งแอดมินว่าเพิ่มสำเร็จ
+                            admin_group_id = config.GROUP_CHAT_ID_FOR_ADMIN
+                            if admin_group_id:
+                                await context.bot.send_message(
+                                    chat_id=admin_group_id,
+                                    text=f"✅ แอดมินเพิ่มสมาชิกใหม่ - บันทึกข้อมูลอัตโนมัติ\n"
+                                         f"👤 Username: {username}\n"
+                                         f"🆔 User ID: {user_id}\n"
+                                         f"📅 หมดอายุ: {expire_date_str}\n"
+                                         f"📊 วิธีการ: เพิ่มโดยแอดมินใน Telegram"
+                                )
+                            return f"Auto-added to Google Sheet: {username}"
+                        else:
+                            # ถ้าเพิ่มใน Google Sheet ไม่สำเร็จ แจ้งแอดมิน
+                            admin_group_id = config.GROUP_CHAT_ID_FOR_ADMIN
+                            if admin_group_id:
+                                await context.bot.send_message(
+                                    chat_id=admin_group_id,
+                                    text=f"⚠️ แอดมินเพิ่มสมาชิกใหม่ แต่บันทึกข้อมูลไม่สำเร็จ\n"
+                                         f"👤 Username: {username}\n"
+                                         f"🆔 User ID: {user_id}\n"
+                                         f"💡 กรุณาใช้คำสั่ง /addmember เพื่อเพิ่มข้อมูลด้วยตนเอง"
+                                )
+                    else:
+                        # ไม่ใช่การเพิ่มโดย admin - ใส่ใน pending list สำหรับการอนุมัติ
+                        from datetime import datetime, timedelta
+                        import pytz
+                        
+                        # ตั้งค่าวันหมดอายุตามประเภทการเข้าร่วมล่าสุด
+                        current_time = datetime.now(pytz.timezone(config.TIMEZONE))
+                        
+                        # กำหนดวันหมดอายุตามประเภท invite link ที่ใช้ล่าสุด
+                        if self.recent_join_type == "1month":
+                            expire_days = config.INVITE_LINK_1MONTH_DAYS
+                            default_expire = current_time + timedelta(days=expire_days)
+                            expire_date_str = default_expire.strftime('%Y-%m-%d %H:%M:%S')
+                        elif self.recent_join_type == "1year":
+                            expire_days = config.INVITE_LINK_1YEAR_DAYS
+                            default_expire = current_time + timedelta(days=expire_days)
+                            expire_date_str = default_expire.strftime('%Y-%m-%d %H:%M:%S')
+                        elif self.recent_join_type == "noexpire":
+                            expire_date_str = config.INVITE_LINK_NOEXPIRE
+                        else:
+                            # สำหรับการเข้าแบบปกติหรือ custom
+                            expire_days = config.DEFAULT_EXPIRE_DAYS
+                            default_expire = current_time + timedelta(days=expire_days)
+                            expire_date_str = default_expire.strftime('%Y-%m-%d %H:%M:%S')
+                        
+                        # เพิ่มใน pending list
+                        self.pending_members[user_id] = {
+                            'username': username,
+                            'first_name': first_name,
+                            'last_name': last_name,
+                            'join_type': self.recent_join_type,
+                            'expire_date_str': expire_date_str,
+                            'timestamp': current_time.strftime('%d/%m/%Y %H:%M:%S')
+                        }
+                        
+                        # รีเซ็ตประเภทการเข้าร่วมกลับเป็น default หลังจากใช้แล้ว
+                        self.recent_join_type = "default"
                     
-                    # เพิ่มใน pending list
-                    self.pending_members[user_id] = {
-                        'username': username,
-                        'first_name': first_name,
-                        'last_name': last_name,
-                        'join_type': self.recent_join_type,
-                        'expire_date_str': expire_date_str,
-                        'timestamp': current_time.strftime('%d/%m/%Y %H:%M:%S')
-                    }
-                    
-                    # รีเซ็ตประเภทการเข้าร่วมกลับเป็น default หลังจากใช้แล้ว
-                    self.recent_join_type = "default"
-                    
-                    # แจ้งเตือนแอดมินด้วยปุ่ม approve/reject
-                    await self.notify_all_admins_with_buttons(context, user_id, username, first_name, last_name, expire_date_str)
+                        # แจ้งเตือนแอดมินด้วยปุ่ม approve/reject (เฉพาะการเข้าผ่าน invite link)
+                        await self.notify_all_admins_with_buttons(context, user_id, username, first_name, last_name, expire_date_str)
                     
                     logger.info(f"New member added to pending list: {username} (ID: {user_id})")
                     return f"New member pending approval: {user_id}"
