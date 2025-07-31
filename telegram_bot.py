@@ -584,7 +584,7 @@ class TelegramMemberBot:
                     # ส่งข้อความแจ้งเตือนในกลุ่ม
                     try:
                         await context.bot.send_message(
-                            chat_id=target_group_id,
+                            chat_id=admin_group_id,
                             text=f"🚫 สมาชิก {username} ถูกลบออกจากกลุ่มโดยแอดมิน"
                         )
                     except Exception as notify_error:
