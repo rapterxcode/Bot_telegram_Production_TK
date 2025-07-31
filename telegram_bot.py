@@ -19,11 +19,60 @@ import config
 from google_sheets import GoogleSheetsManager
 
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# กำหนดค่า logging สำหรับ telegram_bot
+def setup_logging():
+    """ตั้งค่า logging ให้เก็บลงไฟล์และแสดงใน console"""
+    # สร้าง formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # สร้าง logger สำหรับ telegram_bot
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    
+    # ป้องกันการเพิ่ม handler ซ้ำ
+    if logger.handlers:
+        logger.handlers.clear()
+    
+    # Console handler (สำหรับแสดงใน terminal)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    # File handler (สำหรับเก็บลงไฟล์)
+    import os
+    log_dir = "logs"
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    
+    file_handler = logging.FileHandler(
+        os.path.join(log_dir, 'telegram_bot.log'),
+        mode='a',
+        encoding='utf-8'
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    
+    # Rotating file handler สำหรับจำกัดขนาดไฟล์
+    from logging.handlers import RotatingFileHandler
+    rotating_handler = RotatingFileHandler(
+        os.path.join(log_dir, 'telegram_bot_rotating.log'),
+        maxBytes=100*1024*1024,  # 100MB
+        backupCount=5,
+        encoding='utf-8'
+    )
+    rotating_handler.setLevel(logging.INFO)
+    rotating_handler.setFormatter(formatter)
+    logger.addHandler(rotating_handler)
+    
+    return logger
+
+logger = setup_logging()
+logger.info("🚀 Telegram Bot Logger initialized - logging to console and files")
 
 
 class TelegramMemberBot:
