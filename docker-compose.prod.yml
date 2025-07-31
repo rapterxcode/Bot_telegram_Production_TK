@@ -1,0 +1,78 @@
+
+services:
+  tksignal-bot:
+    build: .
+    container_name: tksignal-bot-prod
+    restart: always
+    
+    # Environment variables from .env file
+    env_file:
+      - .env.production  # Use production environment file
+    
+    # Additional environment variables
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=Asia/Bangkok
+      - ENVIRONMENT=production
+    
+    # Mount volumes
+    volumes:
+      - ./credentials.json:/app/credentials.json:ro  # Read-only Google credentials
+      - /etc/localtime:/etc/localtime:ro  # Sync timezone
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('https://api.telegram.org/bot$$TELEGRAM_BOT_TOKEN/getMe')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    
+    # Resource limits for production
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.2'
+          memory: 256M
+    
+    # Production logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+    
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  # Log rotation is handled by Docker logging driver
+
+  # Monitoring with Watchtower (auto-updates)
+  watchtower:
+    image: containrrr/watchtower
+    container_name: tksignal-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_POLL_INTERVAL=86400  # Check daily
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_INCLUDE_STOPPED=true
+      - WATCHTOWER_NOTIFICATIONS=email
+      - WATCHTOWER_NOTIFICATION_EMAIL_FROM=noreply@yourdomian.com
+      - WATCHTOWER_NOTIFICATION_EMAIL_TO=admin@yourdomain.com
+      - WATCHTOWER_NOTIFICATION_EMAIL_SERVER=smtp.gmail.com
+      - WATCHTOWER_NOTIFICATION_EMAIL_SERVER_PORT=587
+    command: tksignal-bot-prod
+
+networks:
+  default:
+    name: tksignal-prod-network
+    driver: bridge

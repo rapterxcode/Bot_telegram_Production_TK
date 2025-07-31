@@ -1,0 +1,61 @@
+
+services:
+  tksignal-bot:
+    build: .
+    container_name: tksignal-bot
+    restart: unless-stopped
+    
+    # Environment variables from .env file
+    env_file:
+      - .env
+    
+    # Additional environment variables
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=Asia/Bangkok
+    
+    # Mount volumes
+    volumes:
+      - ./credentials.json:/app/credentials.json:ro  # Read-only Google credentials
+      - ./logs:/app/logs  # Log directory (optional)
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('https://api.telegram.org/bot$$TELEGRAM_BOT_TOKEN/getMe')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    # Resource limits (optional)
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Optional: Add a monitoring service
+  # watchtower:
+  #   image: containrrr/watchtower
+  #   container_name: watchtower
+  #   restart: unless-stopped
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   environment:
+  #     - WATCHTOWER_POLL_INTERVAL=3600  # Check every hour
+  #     - WATCHTOWER_CLEANUP=true
+  #   command: tksignal-bot
+
+networks:
+  default:
+    name: tksignal-network
