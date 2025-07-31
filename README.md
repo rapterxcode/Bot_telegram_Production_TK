@@ -494,4 +494,4 @@ MIT License - ใช้งานได้อย่างอิสระ
 
 ---
 
-**🎯 TK-Signal Bot - Automated Telegram Group Management Made Easy**
+**🎯 TK-Signal Bot - Automated Telegram Group Management**
