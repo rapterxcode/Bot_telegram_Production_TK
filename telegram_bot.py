@@ -221,21 +221,108 @@ class TelegramMemberBot:
                 )
                 return
             
+            # เพิ่มสมาชิกเข้ากลุ่ม Telegram ก่อน
+            target_group_id = config.GROUP_CHAT_ID
+            telegram_success = False
+            invitation_method = ""
+            
+            try:
+                # ยกเลิกการแบนก่อน (ในกรณีที่เคยถูกแบน)
+                await context.bot.unban_chat_member(
+                    chat_id=target_group_id,
+                    user_id=int(member_user_id),
+                    only_if_banned=True
+                )
+                
+                # วิธี 1: ลองเพิ่มสมาชิกโดยตรงก่อน (สำหรับกรณีที่กลุ่มเป็น public หรือ bot มีสิทธิ์)
+                try:
+                    # ตรวจสอบว่าบอทมีสิทธิ์ add members หรือไม่
+                    bot_member = await context.bot.get_chat_member(target_group_id, context.bot.id)
+                    if bot_member.status in ['administrator', 'creator'] and bot_member.can_invite_users:
+                        # ลองเพิ่มสมาชิกโดยตรง
+                        await context.bot.add_chat_member(
+                            chat_id=target_group_id,
+                            user_id=int(member_user_id)
+                        )
+                        telegram_success = True
+                        invitation_method = "เพิ่มโดยตรง"
+                        
+                        # ส่งข้อความต้นรับให้ user
+                        try:
+                            await context.bot.send_message(
+                                chat_id=int(member_user_id),
+                                text=f"🎉 ยินดีต้อนรับเข้าสู่กลุ่ม!\n"
+                                     f"📅 หมดอายุสมาชิกภาพ: {expire_date}\n"
+                                     f"📋 กรุณาปฏิบัติตามกฎของกลุ่ม"
+                            )
+                        except:
+                            pass  # ไม่ต้องสนใจถ้าส่งข้อความไม่ได้
+                        
+                except Exception as direct_add_error:
+                    print(f"⚠️ ไม่สามารถเพิ่มสมาชิกโดยตรง: {direct_add_error}")
+                    # ถ้าไม่สามารถเพิ่มโดยตรงได้ ให้ใช้วิธี invite link
+                    pass
+                
+                # วิธี 2: ถ้าเพิ่มโดยตรงไม่ได้ ให้สร้าง invite link
+                if not telegram_success:
+                    # สร้าง invite link ชั่วคราวสำหรับสมาชิกคนนี้
+                    invite_link = await context.bot.create_chat_invite_link(
+                        chat_id=target_group_id,
+                        member_limit=1,
+                        creates_join_request=False
+                    )
+                    
+                    # ส่งลิงก์เชิญให้กับ user
+                    try:
+                        await context.bot.send_message(
+                            chat_id=int(member_user_id),
+                            text=f"🎉 คุณได้รับอนุมัติให้เข้าร่วมกลุ่ม!\n"
+                                 f"📅 หมดอายุ: {expire_date}\n"
+                                 f"🔗 คลิกลิงก์เพื่อเข้าร่วม: {invite_link.invite_link}\n\n"
+                                 f"💡 หากคลิกลิงก์ไม่ได้ กรุณาคัดลอกลิงก์แล้วเปิดในแอป Telegram"
+                        )
+                        telegram_success = True
+                        invitation_method = "ส่งลิงก์เชิญ"
+                    except Exception as e:
+                        print(f"⚠️ ไม่สามารถส่งข้อความไปหา user {member_user_id}: {e}")
+                        # สร้าง join request link สำรอง
+                        join_request_link = await context.bot.create_chat_invite_link(
+                            chat_id=target_group_id,
+                            member_limit=1,
+                            creates_join_request=True
+                        )
+                        invitation_method = f"สร้างลิงก์สำรอง (Join Request): {join_request_link.invite_link}"
+                        telegram_success = True
+                
+            except Exception as e:
+                print(f"❌ ข้อผิดพลาดในการเพิ่มสมาชิกเข้ากลุ่ม: {e}")
+                await context.bot.send_message(
+                    chat_id=admin_group_id,
+                    text=f"❌ ไม่สามารถเพิ่มสมาชิกเข้ากลุ่มได้: {str(e)}"
+                )
+                return
+            
             # เพิ่มข้อมูลใน Google Sheet
             success = self.sheets_manager.add_member(username, member_user_id, expire_date)
             
             if success:
+                status_text = "✅ เพิ่มสมาชิกสำเร็จ!\n"
+                status_text += f"👤 Username: {username}\n"
+                status_text += f"🆔 User ID: {member_user_id}\n"
+                status_text += f"📅 หมดอายุ: {expire_date}\n"
+                status_text += f"📊 วิธีการเชิญ: {invitation_method}\n"
+                
+                if "สำรอง" in invitation_method:
+                    status_text += "\n⚠️ ลูกค้าต้องคลิกลิงก์ด้านบนเพื่อส่งคำขอเข้าร่วม\nแล้วแอดมินจะต้องอนุมัติด้วยตนเอง"
+                
                 await context.bot.send_message(
                     chat_id=admin_group_id,
-                    text=f"✅ เพิ่มสมาชิกสำเร็จ!\n"
-                         f"👤 Username: {username}\n"
-                         f"🆔 User ID: {member_user_id}\n"
-                         f"📅 หมดอายุ: {expire_date}"
+                    text=status_text
                 )
             else:
                 await context.bot.send_message(
                     chat_id=admin_group_id,
-                    text="❌ ไม่สามารถเพิ่มข้อมูลได้"
+                    text="❌ ไม่สามารถเพิ่มข้อมูลใน Google Sheet ได้"
                 )
                 
         except Exception as e:
