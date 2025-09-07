@@ -1939,7 +1939,7 @@ class TelegramMemberBot:
         """ตรวจสอบและลบสมาชิกที่หมดอายุ (จะถูกเรียกทุกชั่วโมง)"""
         # ใช้ group_chat_id จาก config หรือที่ตั้งค่าไว้
         target_group_id = self.group_chat_id or config.GROUP_CHAT_ID
-        
+        admin_group_id = config.GROUP_CHAT_ID_FOR_ADMIN
         if not target_group_id:
             logger.warning("Group chat ID not set, cannot remove expired members")
             return
@@ -1984,7 +1984,7 @@ class TelegramMemberBot:
                         
                         # ส่งข้อความแจ้งเตือนในกลุ่ม
                         await context.bot.send_message(
-                            chat_id=target_group_id,
+                            chat_id=admin_group_id,
                             text=f"⚠️ สมาชิก {username} ถูกลบออกจากกลุ่มเนื่องจากหมดอายุ"
                         )
                         
