@@ -165,6 +165,11 @@ class MemberSyncMixin:
 
         sync_time = self.get_current_sync_time()
         sheet_members = self.sheets_manager.get_all_members()
+        sheet_members_by_user_id = {
+            str(member.get("User ID", "")).strip(): member
+            for member in sheet_members
+            if str(member.get("User ID", "")).strip()
+        }
         sheet_user_ids = set()
 
         snapshot = {
@@ -214,6 +219,7 @@ class MemberSyncMixin:
 
         member_payloads = []
         remove_user_ids = []
+        removal_payloads = []
 
         for member in sheet_members:
             member_user_id = str(member.get("User ID", "")).strip()
@@ -235,6 +241,20 @@ class MemberSyncMixin:
 
                 if apply_sheet_changes and remove_missing_from_sheet:
                     remove_user_ids.append(member_user_id)
+                    removal_payloads.append(
+                        {
+                            "User ID": member_user_id,
+                            "Record Status": "removed",
+                            "In Group Now": "No",
+                            "Telegram Status": telegram_status or "not_found",
+                            "Last Sync At": sync_time,
+                            "Last Sync Result": "removed_from_group",
+                            "Sync Note": "Member not found in Telegram group during sync",
+                            "Removed At": sync_time,
+                            "Remove Reason": "Missing from Telegram group during sync",
+                            "Sync Source": "bot_api_sync",
+                        }
+                    )
                 continue
 
             role = self.derive_role_from_chat_member(chat_member)
@@ -256,6 +276,7 @@ class MemberSyncMixin:
                         sync_time=sync_time,
                         sync_note="",
                         sync_source="bot_api_sync",
+                        last_sync_result="verified_in_group",
                     )
                 )
 
@@ -286,6 +307,10 @@ class MemberSyncMixin:
                         sync_time=sync_time,
                         sync_note="Auto-added from Telegram admin list",
                         sync_source="bot_api_admin_backfill",
+                        join_source="bot_api_admin_backfill",
+                        added_by="system",
+                        expire_policy_days=config.SYNC_BACKFILL_EXPIREDATE,
+                        last_sync_result="auto_added_admin_backfill",
                     )
                 )
                 snapshot["admins_auto_added_to_sheet"].append(admin_entry)
@@ -302,6 +327,7 @@ class MemberSyncMixin:
                 member_payloads,
                 remove_user_ids=remove_user_ids if remove_missing_from_sheet else [],
                 required_headers=SYNC_METADATA_HEADERS,
+                removal_payloads=removal_payloads,
             )
             snapshot["rows_added_to_sheet"] = len(sync_result["added_user_ids"])
             snapshot["rows_updated_in_sheet"] = len(sync_result["updated_user_ids"])
@@ -315,8 +341,23 @@ class MemberSyncMixin:
             snapshot["sheet_total_after"] = (
                 snapshot["sheet_total_before"]
                 + snapshot["rows_added_to_sheet"]
-                - len(snapshot["removed_from_sheet"])
             )
+
+            for removed_member in snapshot["removed_from_sheet"]:
+                self.sheets_manager.append_audit_log(
+                    user_id=removed_member["user_id"],
+                    username=removed_member["username"],
+                    action="sync_marked_removed",
+                    old_value=sheet_members_by_user_id.get(removed_member["user_id"], {}),
+                    new_value={
+                        "Record Status": "removed",
+                        "In Group Now": "No",
+                        "Remove Reason": "Missing from Telegram group during sync",
+                    },
+                    actor="system",
+                    source="bot_api_sync",
+                    note="Sync marked this member as removed because Telegram could not find them in the group",
+                )
 
         if snapshot["group_member_count"] is not None:
             known_group_members = snapshot["sheet_in_group_count"] + len(
@@ -479,7 +520,7 @@ class MemberSyncMixin:
             f"จำนวนแถวที่เพิ่มในชีต: {snapshot['rows_added_to_sheet']}",
             f"จำนวนแถวที่อัปเดตในชีต: {snapshot['rows_updated_in_sheet']}",
             f"จำนวนแถวที่ข้อมูลไม่เปลี่ยน: {snapshot['rows_unchanged_in_sheet']}",
-            f"จำนวนผู้ใช้ที่ลบออกจากชีต: {len(snapshot['removed_from_sheet'])}",
+            f"จำนวนสมาชิกที่ถูก mark ว่าออกจากกลุ่ม: {len(snapshot['removed_from_sheet'])}",
             f"จำนวนแอดมินที่เพิ่มเข้าชีตอัตโนมัติ: {len(snapshot['admins_auto_added_to_sheet'])}",
             f"จำนวนแอดมินที่ยังไม่พบในชีต: {len(snapshot['admins_not_in_sheet'])}",
         ]
@@ -491,7 +532,7 @@ class MemberSyncMixin:
 
         if snapshot["removed_from_sheet"]:
             lines.append("")
-            lines.append("รายชื่อที่ถูกลบออกจากชีต:")
+            lines.append("รายชื่อที่ถูก mark ว่าออกจากกลุ่ม:")
             for removed_member in snapshot["removed_from_sheet"][:20]:
                 lines.append(
                     f"- {removed_member['username']} ({removed_member['user_id']}) "
@@ -534,14 +575,14 @@ class MemberSyncMixin:
             f"จำนวนแถวที่เพิ่มในชีต: {snapshot['rows_added_to_sheet']}",
             f"จำนวนแถวที่อัปเดตในชีต: {snapshot['rows_updated_in_sheet']}",
             f"จำนวนแถวที่ข้อมูลไม่เปลี่ยน: {snapshot['rows_unchanged_in_sheet']}",
-            f"จำนวนแถวที่ลบออกจากชีต: {len(snapshot['removed_from_sheet'])}",
+            f"จำนวนสมาชิกที่ถูก mark ว่าออกจากกลุ่ม: {len(snapshot['removed_from_sheet'])}",
             f"กลุ่มเป้าหมาย: {snapshot['group_chat_id']}",
             f"เวลาที่ซิงก์: {snapshot['sync_time']}",
         ]
 
         if snapshot["removed_from_sheet"]:
             lines.append("")
-            lines.append("รายชื่อที่ถูกลบออกจากชีต:")
+            lines.append("รายชื่อที่ถูก mark ว่าออกจากกลุ่ม:")
             for member in snapshot["removed_from_sheet"][:20]:
                 lines.append(f"- {member['username']} ({member['user_id']})")
 
@@ -579,6 +620,10 @@ class MemberSyncMixin:
         sync_time: str,
         sync_note: str,
         sync_source: str,
+        join_source: str = "",
+        added_by: str = "",
+        expire_policy_days: str = "",
+        last_sync_result: str = "verified_in_group",
     ) -> dict:
         """Build a worksheet payload for bulk sync writes."""
         return {
@@ -588,15 +633,19 @@ class MemberSyncMixin:
                 fallback_user_id=user_id,
             ),
             "User ID": user_id,
-            "Expiredate": expire_date,
             "First Name": getattr(telegram_user, "first_name", "") or "",
             "Last Name": getattr(telegram_user, "last_name", "") or "",
+            "Expiredate": expire_date,
+            "Join Source": join_source,
+            "Added By": added_by,
+            "Expire Policy Days": expire_policy_days,
             **self.build_sync_metadata(
                 telegram_status=telegram_status,
                 role=role,
                 sync_time=sync_time,
                 sync_note=sync_note,
                 sync_source=sync_source,
+                last_sync_result=last_sync_result,
             ),
         }
 
@@ -608,14 +657,20 @@ class MemberSyncMixin:
         sync_time: str,
         sync_note: str,
         sync_source: str,
+        last_sync_result: str,
     ) -> dict:
         """Build a consistent sync metadata payload for sheet writes."""
         return {
             "Telegram Status": telegram_status,
             "Role": role,
+            "Record Status": "active",
             "In Group Now": "Yes",
+            "Last Seen In Group At": sync_time,
             "Sync Note": sync_note,
             "Last Sync At": sync_time,
+            "Last Sync Result": last_sync_result,
+            "Removed At": "",
+            "Remove Reason": "",
             "Sync Source": sync_source,
         }
 

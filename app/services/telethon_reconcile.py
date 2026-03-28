@@ -105,6 +105,7 @@ class TelethonReconcileService:
             entity = await client.get_entity(group_chat_id)
             seen_user_ids = set()
             member_payloads = []
+            removal_payloads = []
 
             async for participant_user in client.iter_participants(entity):
                 user_id = str(participant_user.id)
@@ -131,9 +132,21 @@ class TelethonReconcileService:
                         "Last Name": getattr(participant_user, "last_name", "") or "",
                         "Telegram Status": self._derive_telegram_status(participant_user),
                         "Role": role,
+                        "Record Status": "active",
                         "In Group Now": "Yes",
+                        "Join Source": existing_member.get("Join Source", "telethon_full_sync"),
+                        "Invite Link Label": existing_member.get("Invite Link Label", ""),
+                        "Expire Policy Days": existing_member.get("Expire Policy Days", ""),
+                        "Joined At": existing_member.get("Joined At", ""),
+                        "Approved By": existing_member.get("Approved By", ""),
+                        "Approved At": existing_member.get("Approved At", ""),
+                        "Added By": existing_member.get("Added By", "system"),
                         "Sync Note": "",
                         "Last Sync At": sync_time,
+                        "Last Sync Result": "verified_in_group",
+                        "Last Seen In Group At": sync_time,
+                        "Removed At": "",
+                        "Remove Reason": "",
                         "Sync Source": "telethon_full_sync",
                     }
                 )
@@ -143,10 +156,25 @@ class TelethonReconcileService:
                 for user_id in sheet_members_by_user_id
                 if user_id not in seen_user_ids
             ]
+            for user_id in missing_user_ids:
+                removal_payloads.append(
+                    {
+                        "User ID": user_id,
+                        "Record Status": "removed",
+                        "In Group Now": "No",
+                        "Last Sync At": sync_time,
+                        "Last Sync Result": "removed_from_group",
+                        "Sync Note": "Member not found during Telethon full sync",
+                        "Removed At": sync_time,
+                        "Remove Reason": "Missing from Telegram group during Telethon full sync",
+                        "Sync Source": "telethon_full_sync",
+                    }
+                )
             sync_result = self.sheets_manager.bulk_sync_members(
                 member_payloads,
                 remove_user_ids=missing_user_ids,
                 required_headers=SYNC_METADATA_HEADERS,
+                removal_payloads=removal_payloads,
             )
 
             snapshot["rows_added_to_sheet"] = len(sync_result["added_user_ids"])
@@ -165,8 +193,23 @@ class TelethonReconcileService:
             snapshot["sheet_total_after"] = (
                 snapshot["sheet_total_before"]
                 + snapshot["rows_added_to_sheet"]
-                - len(snapshot["removed_from_sheet"])
             )
+
+            for removed_member in snapshot["removed_from_sheet"]:
+                self.sheets_manager.append_audit_log(
+                    user_id=removed_member["user_id"],
+                    username=removed_member["username"],
+                    action="full_sync_marked_removed",
+                    old_value=sheet_members_by_user_id.get(removed_member["user_id"], {}),
+                    new_value={
+                        "Record Status": "removed",
+                        "In Group Now": "No",
+                        "Remove Reason": "Missing from Telegram group during Telethon full sync",
+                    },
+                    actor="system",
+                    source="telethon_full_sync",
+                    note="Full sync marked this member as removed because they were not returned by Telethon",
+                )
 
         logger.info(
             "Telethon full sync completed: group=%s members=%s added=%s removed=%s",

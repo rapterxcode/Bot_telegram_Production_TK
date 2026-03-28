@@ -15,6 +15,55 @@ logger = logging.getLogger(__name__)
 class MembershipEventsMixin:
     """Encapsulate membership updates and join-request flows."""
 
+    @staticmethod
+    def _is_member_in_group(chat_member) -> bool:
+        """Return True when the Telegram chat member still counts as present."""
+        if not chat_member:
+            return False
+
+        status = getattr(chat_member, "status", "")
+        if status in {"member", "administrator", "creator"}:
+            return True
+        if status == "restricted":
+            return bool(getattr(chat_member, "is_member", False))
+        return False
+
+    @staticmethod
+    def _format_actor_label(actor_user) -> str:
+        """Build a compact actor label for audit fields."""
+        if not actor_user:
+            return ""
+        if getattr(actor_user, "username", None):
+            return f"@{actor_user.username}"
+        full_name = " ".join(
+            part for part in [actor_user.first_name, actor_user.last_name] if part
+        ).strip()
+        return full_name or f"user_{actor_user.id}"
+
+    def _append_group_audit_log(
+        self,
+        *,
+        user_id: str,
+        username: str,
+        action: str,
+        old_value="",
+        new_value="",
+        actor: str = "",
+        source: str = "",
+        note: str = "",
+    ):
+        """Write a best-effort member audit log entry."""
+        self.sheets_manager.append_audit_log(
+            user_id=user_id,
+            username=username,
+            action=action,
+            old_value=old_value,
+            new_value=new_value,
+            actor=actor,
+            source=source,
+            note=note,
+        )
+
     async def track_chat_member_updates(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await self.handle_chat_member_update(update.chat_member, context)
         if result:
@@ -31,16 +80,25 @@ class MembershipEventsMixin:
         username = f"@{user.username}" if user.username else f"User_{user.id}"
         first_name = user.first_name or ""
         last_name = user.last_name or ""
+        actor_user = (
+            chat_member_update.from_user
+            if hasattr(chat_member_update, "from_user")
+            else None
+        )
+        actor_label = self._format_actor_label(actor_user)
 
         if (
-            old_member.status in ["left", "kicked"]
-            and new_member.status in ["member", "administrator", "creator"]
+            not self._is_member_in_group(old_member)
+            and self._is_member_in_group(new_member)
         ):
             target_group_id = self.group_chat_id or config.GROUP_CHAT_ID
             if chat_member_update.chat.id == target_group_id:
-                existing_members = self.sheets_manager.get_all_members()
-                member_exists = any(
-                    member.get("User ID") == user_id for member in existing_members
+                existing_member = self.sheets_manager.get_member_record(
+                    user_id,
+                    include_inactive=True,
+                )
+                member_exists = bool(
+                    existing_member and self.sheets_manager._is_member_active(existing_member)
                 )
 
                 if user_id in self.pending_members:
@@ -68,9 +126,39 @@ class MembershipEventsMixin:
                             expire_date_str,
                             first_name,
                             last_name,
+                            metadata={
+                                "Role": "admin"
+                                if new_member.status in ["administrator", "creator"]
+                                else "member",
+                                "Telegram Status": new_member.status,
+                                "Record Status": "active",
+                                "In Group Now": "Yes",
+                                "Join Source": "admin_added",
+                                "Expire Policy Days": expire_days,
+                                "Joined At": current_time.strftime("%Y-%m-%d %H:%M:%S"),
+                                "Added By": actor_label,
+                                "Last Seen In Group At": current_time.strftime("%Y-%m-%d %H:%M:%S"),
+                                "Last Sync Result": "member_joined",
+                                "Sync Note": "Added by admin in Telegram",
+                                "Sync Source": "chat_member_update",
+                            },
                         )
 
                         if success:
+                            self._append_group_audit_log(
+                                user_id=user_id,
+                                username=username,
+                                action="member_joined",
+                                new_value={
+                                    "Username": username,
+                                    "User ID": user_id,
+                                    "Join Source": "admin_added",
+                                    "Expiredate": expire_date_str,
+                                },
+                                actor=actor_label,
+                                source="chat_member_update",
+                                note="Admin added a member directly in Telegram",
+                            )
                             admin_group_id = config.GROUP_CHAT_ID_FOR_ADMIN
                             if admin_group_id:
                                 await context.bot.send_message(
@@ -131,6 +219,15 @@ class MembershipEventsMixin:
                                 "first_name": first_name,
                                 "last_name": last_name,
                                 "join_type": join_type,
+                                "join_source": "member_update",
+                                "invite_link_label": "",
+                                "expire_policy_days": expire_days if join_type == "default" else (
+                                    config.INVITE_LINK_1MONTH_DAYS
+                                    if join_type == "1month"
+                                    else config.INVITE_LINK_1YEAR_DAYS
+                                    if join_type == "1year"
+                                    else config.INVITE_LINK_NOEXPIRE
+                                ),
                                 "expire_date_str": expire_date_str,
                                 "timestamp": current_time.strftime("%d/%m/%Y %H:%M:%S"),
                                 "approval_mode": "member_update",
@@ -146,9 +243,81 @@ class MembershipEventsMixin:
                             last_name,
                             expire_date_str,
                         )
+                        self._append_group_audit_log(
+                            user_id=user_id,
+                            username=username,
+                            action="member_joined_pending_review",
+                            new_value={
+                                "Username": username,
+                                "User ID": user_id,
+                                "Join Source": "member_update",
+                                "Expiredate": expire_date_str,
+                            },
+                            actor=actor_label,
+                            source="chat_member_update",
+                            note="Member joined the group and is waiting for approval flow",
+                        )
 
                     logger.info("New member added to pending list: %s (ID: %s)", username, user_id)
                     return f"New member pending approval: {user_id}"
+
+        elif self._is_member_in_group(old_member) and not self._is_member_in_group(new_member):
+            target_group_id = self.group_chat_id or config.GROUP_CHAT_ID
+            if chat_member_update.chat.id != target_group_id:
+                return None
+
+            existing_member = self.sheets_manager.get_member_record(
+                user_id,
+                include_inactive=True,
+            )
+            removed_at = datetime.now(pytz.timezone(config.TIMEZONE)).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            new_status = getattr(new_member, "status", "left")
+            if new_status == "kicked":
+                remove_reason = "Removed from Telegram group"
+                audit_action = "member_kicked_from_group"
+                note = "Telegram reported that the member was removed from the group"
+            else:
+                remove_reason = "Left Telegram group"
+                audit_action = "member_left_group"
+                note = "Telegram reported that the member left the group"
+
+            if existing_member and self.sheets_manager._is_member_active(existing_member):
+                self.sheets_manager.remove_member_from_sheet(
+                    user_id=user_id,
+                    removed_at=removed_at,
+                    remove_reason=remove_reason,
+                    actor=actor_label,
+                    source="chat_member_update",
+                    note=note,
+                    audit_action=audit_action,
+                    last_seen_in_group_at=removed_at,
+                )
+            else:
+                self._append_group_audit_log(
+                    user_id=user_id,
+                    username=username,
+                    action=audit_action,
+                    old_value={
+                        "Username": username,
+                        "User ID": user_id,
+                        "Telegram Status": getattr(old_member, "status", ""),
+                    },
+                    new_value={
+                        "Telegram Status": new_status,
+                        "Record Status": "removed",
+                        "In Group Now": "No",
+                        "Last Seen In Group At": removed_at,
+                        "Removed At": removed_at,
+                        "Remove Reason": remove_reason,
+                    },
+                    actor=actor_label,
+                    source="chat_member_update",
+                    note=note,
+                )
+
+            return f"Member removed from group: {user_id}"
 
         elif old_member and new_member and old_member.status == new_member.status:
             old_username = old_member.user.username
@@ -195,8 +364,13 @@ class MembershipEventsMixin:
             )
             return
 
-        existing_members = self.sheets_manager.get_all_members()
-        member_exists = any(member.get("User ID") == user_id for member in existing_members)
+        existing_member = self.sheets_manager.get_member_record(
+            user_id,
+            include_inactive=True,
+        )
+        member_exists = bool(
+            existing_member and self.sheets_manager._is_member_active(existing_member)
+        )
         logger.info("Member exists in sheet: %s", member_exists)
 
         if member_exists:
@@ -296,6 +470,13 @@ class MembershipEventsMixin:
                 "first_name": first_name,
                 "last_name": last_name,
                 "join_type": join_type,
+                "join_source": "join_request",
+                "invite_link_label": link_info.get("period_name", "") if link_info else "",
+                "expire_policy_days": (
+                    link_info.get("days")
+                    if link_info
+                    else config.DEFAULT_EXPIRE_DAYS
+                ),
                 "expire_date_str": expire_date_str,
                 "timestamp": current_time.strftime("%d/%m/%Y %H:%M:%S"),
                 "chat_id": join_request.chat.id,

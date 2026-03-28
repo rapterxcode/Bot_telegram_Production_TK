@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
 import pytz
@@ -32,30 +33,62 @@ class MemberRowLocation:
 class SheetSnapshot:
     """In-memory representation of the worksheet for a sync pass."""
 
+    worksheet_name: str
     headers: List[str]
     rows: List[List[str]]
     member_locations: Dict[str, MemberRowLocation]
 
 
 class GoogleSheetsManager:
-    """Read and write member data in a single worksheet."""
+    """Read and write member data in the Members and audit worksheets."""
 
-    BASE_MEMBER_HEADERS = [
+    MEMBER_HEADERS = [
         "Username",
         "User ID",
-        "Expiredate",
-        "Added At",
         "First Name",
         "Last Name",
+        "Role",
+        "Telegram Status",
+        "Record Status",
+        "In Group Now",
+        "Join Source",
+        "Invite Link Label",
+        "Expire Policy Days",
+        "Expiredate",
+        "Joined At",
+        "Approved By",
+        "Approved At",
+        "Added By",
+        "Datetime (UTC)",
+        "Last Sync At",
+        "Last Sync Result",
+        "Sync Note",
+        "Last Seen In Group At",
+        "Removed At",
+        "Remove Reason",
+        "Sync Source",
     ]
-    MEMBER_COLUMNS = 6
+    AUDIT_LOG_HEADERS = [
+        "Event Time",
+        "User ID",
+        "Username",
+        "Action",
+        "Old Value",
+        "New Value",
+        "Actor",
+        "Source",
+        "Note",
+    ]
+    ACTIVE_RECORD_STATUSES = {"", "active"}
+    ACTIVE_IN_GROUP_VALUES = {"", "yes"}
 
     def __init__(self, service=None, spreadsheet_id: Optional[str] = None):
         self.credentials = None
         self.service = service
         self.spreadsheet_id = spreadsheet_id or config.GOOGLE_SHEETS_ID
         self.worksheet_name = config.WORKSHEET_NAME
-        self._sheet_id_cache = None
+        self.audit_worksheet_name = config.AUDIT_WORKSHEET_NAME
+        self._sheet_id_cache: Dict[str, int] = {}
 
         if self.service is None:
             self.authenticate()
@@ -73,27 +106,32 @@ class GoogleSheetsManager:
             logger.exception("Failed to authenticate with Google Sheets")
             raise
 
-    def get_all_members(self) -> List[Dict]:
-        """Return all member rows that have both username and user ID."""
+    def get_all_members(self, *, include_inactive: bool = False) -> List[Dict]:
+        """Return member rows, optionally including removed/history rows."""
         try:
-            values = self._get_sheet_values()
-            if not values:
-                return []
-
-            headers = values[0]
+            snapshot = self.load_sheet_snapshot(
+                worksheet_name=self.worksheet_name,
+                header_template=self.MEMBER_HEADERS,
+            )
             members = []
-            for row in values[1:]:
-                padded_row = self._pad_row(row, len(headers))
+            for row in snapshot.rows[1:]:
+                padded_row = self._pad_row(row, len(snapshot.headers))
                 member = {
                     header: padded_row[index]
-                    for index, header in enumerate(headers)
+                    for index, header in enumerate(snapshot.headers)
                 }
-                if member.get("User ID") and member.get("Username"):
-                    members.append(member)
+                if not member.get("User ID") or not member.get("Username"):
+                    continue
+                if not include_inactive and not self._is_member_active(member):
+                    continue
+                members.append(member)
 
             return members
         except HttpError:
             logger.exception("Failed to read members from Google Sheets")
+            return []
+        except Exception:
+            logger.exception("Unexpected failure reading members from Google Sheets")
             return []
 
     def get_expired_members(self) -> List[Dict]:
@@ -140,30 +178,42 @@ class GoogleSheetsManager:
         expire_date: str,
         first_name: str = "",
         last_name: str = "",
+        metadata: Optional[Dict[str, object]] = None,
     ) -> bool:
         """Insert a new member or update the existing row matched by User ID."""
+        metadata = dict(metadata or {})
         try:
-            snapshot = self.load_sheet_snapshot()
-            location = snapshot.member_locations.get(str(user_id))
+            local_now = self._now_local_string()
+            payload = {
+                "Username": username,
+                "User ID": str(user_id),
+                "First Name": first_name,
+                "Last Name": last_name,
+                "Role": metadata.get("Role", ""),
+                "Telegram Status": metadata.get("Telegram Status", ""),
+                "Record Status": metadata.get("Record Status", "active"),
+                "In Group Now": metadata.get("In Group Now", "Yes"),
+                "Join Source": metadata.get("Join Source", "manual"),
+                "Invite Link Label": metadata.get("Invite Link Label", ""),
+                "Expire Policy Days": metadata.get("Expire Policy Days", ""),
+                "Expiredate": expire_date,
+                "Joined At": metadata.get("Joined At", local_now),
+                "Approved By": metadata.get("Approved By", ""),
+                "Approved At": metadata.get("Approved At", ""),
+                "Added By": metadata.get("Added By", "system"),
+                "Datetime (UTC)": metadata.get("Datetime (UTC)", self._now_utc_string()),
+                "Last Sync At": metadata.get("Last Sync At", ""),
+                "Last Sync Result": metadata.get("Last Sync Result", ""),
+                "Sync Note": metadata.get("Sync Note", ""),
+                "Last Seen In Group At": metadata.get("Last Seen In Group At", local_now),
+                "Removed At": metadata.get("Removed At", ""),
+                "Remove Reason": metadata.get("Remove Reason", ""),
+                "Sync Source": metadata.get("Sync Source", ""),
+            }
 
-            if location:
-                return self._update_existing_member(
-                    location=location,
-                    username=username,
-                    user_id=user_id,
-                    expire_date=expire_date,
-                    first_name=first_name,
-                    last_name=last_name,
-                )
-
-            return self._insert_member(
-                next_row=len(snapshot.rows) + 1,
-                username=username,
-                user_id=user_id,
-                expire_date=expire_date,
-                first_name=first_name,
-                last_name=last_name,
-            )
+            self.upsert_member_record(payload)
+            logger.info("Upserted member %s (user ID %s)", username, user_id)
+            return True
         except HttpError:
             logger.exception("Failed to upsert member %s in Google Sheets", user_id)
             return False
@@ -187,36 +237,80 @@ class GoogleSheetsManager:
             new_value=new_expire_date,
         )
 
-    def remove_member_from_sheet(self, user_id: str) -> bool:
-        """Delete a member row using the configured worksheet name."""
-        try:
-            snapshot = self.load_sheet_snapshot()
-            location = snapshot.member_locations.get(str(user_id))
-            if not location:
-                logger.info(
-                    "User ID %s was not found in worksheet %s",
-                    user_id,
-                    self.worksheet_name,
-                )
-                return False
-
-            self._delete_rows_by_numbers(
-                [location.row_number],
-                action_name="delete_member_row",
+    def remove_member_from_sheet(
+        self,
+        user_id: str,
+        *,
+        removed_at: Optional[str] = None,
+        remove_reason: str = "Removed from group",
+        actor: str = "",
+        source: str = "manual_remove",
+        note: str = "",
+        audit_action: str = "member_removed",
+        last_seen_in_group_at: Optional[str] = None,
+    ) -> bool:
+        """Soft-delete a member row while preserving history fields."""
+        existing_member = self.get_member_record(user_id, include_inactive=True)
+        if not existing_member:
+            logger.info(
+                "User ID %s was not found in worksheet %s",
+                user_id,
+                self.worksheet_name,
             )
-            logger.info("Deleted member row for user ID %s", user_id)
-            return True
-        except HttpError:
-            logger.exception("Failed to delete member %s from worksheet", user_id)
             return False
-        except Exception:
-            logger.exception("Unexpected failure deleting member %s", user_id)
+
+        removed_at = removed_at or self._now_local_string()
+        last_seen_in_group_at = (
+            last_seen_in_group_at
+            or existing_member.get("Last Seen In Group At", "")
+            or removed_at
+        )
+        update_success = self.update_member_fields(
+            user_id,
+            {
+                "Record Status": "removed",
+                "In Group Now": "No",
+                "Last Seen In Group At": last_seen_in_group_at,
+                "Removed At": removed_at,
+                "Remove Reason": remove_reason,
+                "Last Sync At": removed_at,
+                "Last Sync Result": "removed",
+                "Sync Note": note,
+                "Sync Source": source,
+            },
+        )
+        if not update_success:
             return False
+
+        self.append_audit_log(
+            user_id=user_id,
+            username=existing_member.get("Username", ""),
+            action=audit_action,
+            old_value=existing_member,
+            new_value={
+                "Record Status": "removed",
+                "In Group Now": "No",
+                "Last Seen In Group At": last_seen_in_group_at,
+                "Removed At": removed_at,
+                "Remove Reason": remove_reason,
+            },
+            actor=actor,
+            source=source,
+            note=note or remove_reason,
+        )
+        logger.info("Marked member %s as removed", user_id)
+        return True
 
     def ensure_headers(self, required_headers: List[str]) -> List[str]:
         """Ensure the worksheet header row contains the given headers."""
-        snapshot = self.load_sheet_snapshot()
-        snapshot = self.ensure_headers_in_snapshot(snapshot, required_headers)
+        snapshot = self.load_sheet_snapshot(
+            worksheet_name=self.worksheet_name,
+            header_template=self.MEMBER_HEADERS,
+        )
+        snapshot = self.ensure_headers_in_snapshot(
+            snapshot,
+            self.MEMBER_HEADERS + list(required_headers),
+        )
         return snapshot.headers
 
     def update_member_fields(self, user_id: str, field_values: Dict[str, str]) -> bool:
@@ -225,8 +319,14 @@ class GoogleSheetsManager:
             return True
 
         try:
-            snapshot = self.load_sheet_snapshot()
-            snapshot = self.ensure_headers_in_snapshot(snapshot, list(field_values.keys()))
+            snapshot = self.load_sheet_snapshot(
+                worksheet_name=self.worksheet_name,
+                header_template=self.MEMBER_HEADERS,
+            )
+            snapshot = self.ensure_headers_in_snapshot(
+                snapshot,
+                self.MEMBER_HEADERS + list(field_values.keys()),
+            )
 
             location = snapshot.member_locations.get(str(user_id))
             if not location:
@@ -251,9 +351,11 @@ class GoogleSheetsManager:
                 return True
 
             self._execute_value_batch_updates(
-                [
+                worksheet_name=self.worksheet_name,
+                value_updates=[
                     {
                         "range": self._build_row_range(
+                            worksheet_name=self.worksheet_name,
                             row_number=location.row_number,
                             last_column_index=len(snapshot.headers) - 1,
                         ),
@@ -275,21 +377,32 @@ class GoogleSheetsManager:
 
     def bulk_sync_members(
         self,
-        member_payloads: List[Dict[str, str]],
+        member_payloads: List[Dict[str, object]],
         *,
         remove_user_ids: Optional[List[str]] = None,
         required_headers: Optional[List[str]] = None,
+        removal_payloads: Optional[List[Dict[str, object]]] = None,
     ) -> Dict[str, List[str]]:
-        """Apply a sync diff using batched value updates and row deletes."""
-        snapshot = self.load_sheet_snapshot()
+        """Apply a sync diff using batched row updates."""
+        snapshot = self.load_sheet_snapshot(
+            worksheet_name=self.worksheet_name,
+            header_template=self.MEMBER_HEADERS,
+        )
 
         inferred_headers = list(required_headers or [])
         for payload in member_payloads:
             for header_name in payload:
-                if header_name not in self.BASE_MEMBER_HEADERS and header_name not in inferred_headers:
+                if header_name not in inferred_headers:
+                    inferred_headers.append(header_name)
+        for payload in removal_payloads or []:
+            for header_name in payload:
+                if header_name not in inferred_headers:
                     inferred_headers.append(header_name)
 
-        snapshot = self.ensure_headers_in_snapshot(snapshot, inferred_headers)
+        snapshot = self.ensure_headers_in_snapshot(
+            snapshot,
+            self.MEMBER_HEADERS + inferred_headers,
+        )
 
         next_row_number = len(snapshot.rows) + 1
         value_updates = []
@@ -322,6 +435,7 @@ class GoogleSheetsManager:
             value_updates.append(
                 {
                     "range": self._build_row_range(
+                        worksheet_name=self.worksheet_name,
                         row_number=row_number,
                         last_column_index=len(snapshot.headers) - 1,
                     ),
@@ -333,19 +447,68 @@ class GoogleSheetsManager:
                 updated_user_ids.append(user_id)
             else:
                 added_user_ids.append(user_id)
+                snapshot.member_locations[user_id] = MemberRowLocation(
+                    row_number=row_number,
+                    row_values=updated_row,
+                )
                 next_row_number += 1
 
+        removal_payloads = list(removal_payloads or [])
+        for user_id in remove_user_ids or []:
+            if any(str(payload.get("User ID", "")) == str(user_id) for payload in removal_payloads):
+                continue
+            removal_payloads.append(
+                {
+                    "User ID": str(user_id),
+                    "Record Status": "removed",
+                    "In Group Now": "No",
+                    "Last Sync At": self._now_local_string(),
+                    "Last Sync Result": "removed",
+                    "Removed At": self._now_local_string(),
+                    "Remove Reason": "Missing from Telegram group during sync",
+                    "Sync Note": "Marked removed during member sync",
+                    "Sync Source": "bot_api_sync",
+                }
+            )
+
+        removed_user_ids = []
+        for payload in removal_payloads:
+            normalized_payload = self._normalize_member_payload(payload)
+            user_id = normalized_payload.get("User ID", "")
+            if not user_id:
+                continue
+
+            location = snapshot.member_locations.get(user_id)
+            if not location:
+                continue
+
+            existing_row = self._pad_row(location.row_values, len(snapshot.headers))
+            updated_row = self._build_row_from_payload(
+                headers=snapshot.headers,
+                payload=normalized_payload,
+                existing_row=existing_row,
+            )
+
+            if updated_row != existing_row:
+                value_updates.append(
+                    {
+                        "range": self._build_row_range(
+                            worksheet_name=self.worksheet_name,
+                            row_number=location.row_number,
+                            last_column_index=len(snapshot.headers) - 1,
+                        ),
+                        "values": [updated_row],
+                    }
+                )
+            removed_user_ids.append(user_id)
+
         self._execute_value_batch_updates(
-            value_updates,
+            worksheet_name=self.worksheet_name,
+            value_updates=value_updates,
             action_name="bulk_sync_member_rows",
             added_count=len(added_user_ids),
             updated_count=len(updated_user_ids),
-        )
-
-        removed_user_ids = self._delete_rows_by_user_ids(
-            snapshot,
-            remove_user_ids or [],
-            action_name="bulk_sync_delete_rows",
+            removed_count=len(removed_user_ids),
         )
 
         return {
@@ -355,18 +518,32 @@ class GoogleSheetsManager:
             "removed_user_ids": removed_user_ids,
         }
 
-    def load_sheet_snapshot(self) -> SheetSnapshot:
-        """Load the worksheet once and index rows by user ID."""
-        values = self._get_sheet_values()
+    def load_sheet_snapshot(
+        self,
+        *,
+        worksheet_name: str,
+        header_template: Optional[List[str]] = None,
+    ) -> SheetSnapshot:
+        """Load a worksheet once and index rows by user ID when possible."""
+        self._ensure_worksheet_exists(worksheet_name)
+        values = self._get_sheet_values(worksheet_name)
         if not values:
-            raise ValueError(
-                f"Worksheet '{self.worksheet_name}' is empty and has no header row"
-            )
+            if not header_template:
+                raise ValueError(
+                    f"Worksheet '{worksheet_name}' is empty and has no header row"
+                )
+            self._write_header_row(worksheet_name, header_template)
+            values = [list(header_template)]
 
         headers = list(values[0])
         rows = [list(row) for row in values]
         member_locations = self._build_member_locations(headers, rows)
-        return SheetSnapshot(headers=headers, rows=rows, member_locations=member_locations)
+        return SheetSnapshot(
+            worksheet_name=worksheet_name,
+            headers=headers,
+            rows=rows,
+            member_locations=member_locations,
+        )
 
     def ensure_headers_in_snapshot(
         self,
@@ -374,17 +551,19 @@ class GoogleSheetsManager:
         required_headers: List[str],
     ) -> SheetSnapshot:
         """Ensure headers exist and keep the in-memory snapshot aligned."""
-        missing_headers = [
-            header_name
-            for header_name in required_headers
-            if header_name and header_name not in snapshot.headers
-        ]
+        seen_headers = set(snapshot.headers)
+        missing_headers = []
+        for header_name in required_headers:
+            if not header_name or header_name in seen_headers:
+                continue
+            missing_headers.append(header_name)
+            seen_headers.add(header_name)
         if not missing_headers:
             return snapshot
 
         updated_headers = list(snapshot.headers) + missing_headers
         header_range = (
-            f"{self.worksheet_name}!A1:{self._column_letter(len(updated_headers) - 1)}1"
+            f"{snapshot.worksheet_name}!A1:{self._column_letter(len(updated_headers) - 1)}1"
         )
         self._execute_write_request(
             action_name="ensure_headers",
@@ -397,146 +576,216 @@ class GoogleSheetsManager:
                 body={"values": [updated_headers]},
             )
             .execute(),
+            worksheet_name=snapshot.worksheet_name,
             added_headers=",".join(missing_headers),
         )
 
-        logger.info("Added worksheet headers: %s", ", ".join(missing_headers))
+        logger.info(
+            "Added worksheet headers to %s: %s",
+            snapshot.worksheet_name,
+            ", ".join(missing_headers),
+        )
         snapshot.headers = updated_headers
         snapshot.rows[0] = updated_headers
         return snapshot
 
-    def _get_sheet_values(self) -> List[List[str]]:
+    def append_audit_log(
+        self,
+        *,
+        user_id: str,
+        username: str,
+        action: str,
+        old_value="",
+        new_value="",
+        actor: str = "",
+        source: str = "",
+        note: str = "",
+        event_time: Optional[str] = None,
+    ) -> bool:
+        """Append a member audit log row to the audit worksheet."""
+        try:
+            snapshot = self.load_sheet_snapshot(
+                worksheet_name=self.audit_worksheet_name,
+                header_template=self.AUDIT_LOG_HEADERS,
+            )
+            snapshot = self.ensure_headers_in_snapshot(
+                snapshot,
+                self.AUDIT_LOG_HEADERS,
+            )
+            row_number = len(snapshot.rows) + 1
+            row_values = [
+                event_time or self._now_local_string(),
+                str(user_id),
+                username,
+                action,
+                self._serialize_audit_value(old_value),
+                self._serialize_audit_value(new_value),
+                actor,
+                source,
+                note,
+            ]
+            self._execute_write_request(
+                action_name="append_audit_log",
+                execute_callable=lambda: self.service.spreadsheets()
+                .values()
+                .update(
+                    spreadsheetId=self.spreadsheet_id,
+                    range=self._build_row_range(
+                        worksheet_name=self.audit_worksheet_name,
+                        row_number=row_number,
+                        last_column_index=len(snapshot.headers) - 1,
+                    ),
+                    valueInputOption="RAW",
+                    body={"values": [row_values]},
+                )
+                .execute(),
+                worksheet_name=self.audit_worksheet_name,
+                user_id=user_id,
+                action=action,
+                row_number=row_number,
+            )
+            logger.info("Appended audit log for user %s action %s", user_id, action)
+            return True
+        except Exception:
+            logger.exception("Failed to append audit log for user %s", user_id)
+            return False
+
+    def get_member_record(
+        self,
+        user_id: str,
+        *,
+        include_inactive: bool = True,
+    ) -> Optional[Dict[str, str]]:
+        """Return a single member record by user ID when present."""
+        for member in self.get_all_members(include_inactive=include_inactive):
+            if str(member.get("User ID")) == str(user_id):
+                return member
+        return None
+
+    def upsert_member_record(self, payload: Dict[str, object]) -> Dict[str, object]:
+        """Insert or update a member record in the Members worksheet."""
+        snapshot = self.load_sheet_snapshot(
+            worksheet_name=self.worksheet_name,
+            header_template=self.MEMBER_HEADERS,
+        )
+        snapshot = self.ensure_headers_in_snapshot(snapshot, self.MEMBER_HEADERS)
+
+        normalized_payload = self._normalize_member_payload(payload)
+        user_id = normalized_payload.get("User ID", "")
+        if not user_id:
+            raise ValueError("User ID is required to upsert a member record")
+
+        location = snapshot.member_locations.get(user_id)
+        row_number = location.row_number if location else len(snapshot.rows) + 1
+        existing_row = self._pad_row(
+            location.row_values if location else [],
+            len(snapshot.headers),
+        )
+        updated_row = self._build_row_from_payload(
+            headers=snapshot.headers,
+            payload=normalized_payload,
+            existing_row=existing_row,
+        )
+
+        if location and updated_row == existing_row:
+            return {"changed": False, "row_number": row_number, "created": False}
+
+        self._execute_value_batch_updates(
+            worksheet_name=self.worksheet_name,
+            value_updates=[
+                {
+                    "range": self._build_row_range(
+                        worksheet_name=self.worksheet_name,
+                        row_number=row_number,
+                        last_column_index=len(snapshot.headers) - 1,
+                    ),
+                    "values": [updated_row],
+                }
+            ],
+            action_name="upsert_member_record",
+            user_id=user_id,
+            row_number=row_number,
+        )
+        return {
+            "changed": True,
+            "row_number": row_number,
+            "created": location is None,
+        }
+
+    def _get_sheet_values(self, worksheet_name: str) -> List[List[str]]:
         result = (
             self.service.spreadsheets()
             .values()
             .get(
                 spreadsheetId=self.spreadsheet_id,
-                range=f"{self.worksheet_name}!A:Z",
+                range=f"{worksheet_name}!A:Z",
             )
             .execute()
         )
         return result.get("values", [])
 
-    def _insert_member(
-        self,
-        next_row: int,
-        username: str,
-        user_id: str,
-        expire_date: str,
-        first_name: str,
-        last_name: str,
-    ) -> bool:
-        row_values = self._build_member_row(
-            username=username,
-            user_id=user_id,
-            expire_date=expire_date,
-            first_name=first_name,
-            last_name=last_name,
+    def _write_header_row(self, worksheet_name: str, headers: List[str]):
+        header_range = (
+            f"{worksheet_name}!A1:{self._column_letter(len(headers) - 1)}1"
         )
-        range_name = f"{self.worksheet_name}!A{next_row}:F{next_row}"
-
         self._execute_write_request(
-            action_name="insert_member",
+            action_name="initialize_header_row",
             execute_callable=lambda: self.service.spreadsheets()
             .values()
             .update(
                 spreadsheetId=self.spreadsheet_id,
-                range=range_name,
+                range=header_range,
                 valueInputOption="RAW",
-                body={"values": [row_values]},
+                body={"values": [headers]},
             )
             .execute(),
-            user_id=user_id,
-            username=username,
-            row_number=next_row,
+            worksheet_name=worksheet_name,
         )
 
-        logger.info("Inserted member %s (user ID %s)", username, user_id)
-        return True
+    def _ensure_worksheet_exists(self, worksheet_name: str):
+        if worksheet_name in self._sheet_id_cache:
+            return
 
-    def _update_existing_member(
-        self,
-        location: MemberRowLocation,
-        username: str,
-        user_id: str,
-        expire_date: str,
-        first_name: str,
-        last_name: str,
-    ) -> bool:
-        updated_row = self._build_member_row(
-            username=username,
-            user_id=user_id,
-            expire_date=expire_date,
-            first_name=first_name,
-            last_name=last_name,
-            existing_row=location.row_values,
-        )
-        existing_row = self._pad_row(location.row_values, self.MEMBER_COLUMNS)[: self.MEMBER_COLUMNS]
+        spreadsheet = self.service.spreadsheets().get(
+            spreadsheetId=self.spreadsheet_id,
+        ).execute()
+        for sheet in spreadsheet.get("sheets", []):
+            properties = sheet.get("properties", {})
+            if properties.get("title") == worksheet_name:
+                self._sheet_id_cache[worksheet_name] = properties["sheetId"]
+                return
 
-        if updated_row == existing_row:
-            logger.info(
-                "Member %s already matches worksheet data; skipping update",
-                user_id,
-            )
-            return True
-
-        range_name = f"{self.worksheet_name}!A{location.row_number}:F{location.row_number}"
         self._execute_write_request(
-            action_name="update_member_row",
+            action_name="create_worksheet",
             execute_callable=lambda: self.service.spreadsheets()
-            .values()
-            .update(
+            .batchUpdate(
                 spreadsheetId=self.spreadsheet_id,
-                range=range_name,
-                valueInputOption="RAW",
-                body={"values": [updated_row]},
+                body={
+                    "requests": [
+                        {
+                            "addSheet": {
+                                "properties": {
+                                    "title": worksheet_name,
+                                }
+                            }
+                        }
+                    ]
+                },
             )
             .execute(),
-            user_id=user_id,
-            username=username,
-            row_number=location.row_number,
+            worksheet_name=worksheet_name,
         )
 
-        logger.info("Updated member %s in worksheet row %s", user_id, location.row_number)
-        return True
+        spreadsheet = self.service.spreadsheets().get(
+            spreadsheetId=self.spreadsheet_id,
+        ).execute()
+        for sheet in spreadsheet.get("sheets", []):
+            properties = sheet.get("properties", {})
+            if properties.get("title") == worksheet_name:
+                self._sheet_id_cache[worksheet_name] = properties["sheetId"]
+                return
 
-    def _update_single_field(
-        self,
-        user_id: str,
-        header_name: str,
-        new_value: str,
-    ) -> bool:
-        return self.update_member_fields(
-            user_id=user_id,
-            field_values={header_name: new_value},
-        )
-
-    def _build_member_row(
-        self,
-        username: str,
-        user_id: str,
-        expire_date: str,
-        first_name: str = "",
-        last_name: str = "",
-        existing_row: Optional[List[str]] = None,
-    ) -> List[str]:
-        current_time = datetime.now(pytz.timezone(config.TIMEZONE)).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-        padded_existing_row = self._pad_row(existing_row or [], self.MEMBER_COLUMNS)
-
-        created_at = padded_existing_row[3] or current_time
-        stored_first_name = padded_existing_row[4]
-        stored_last_name = padded_existing_row[5]
-
-        return [
-            username,
-            str(user_id),
-            expire_date,
-            created_at,
-            first_name or stored_first_name,
-            last_name or stored_last_name,
-        ]
+        raise ValueError(f"Worksheet '{worksheet_name}' not found")
 
     def _build_row_from_payload(
         self,
@@ -547,44 +796,17 @@ class GoogleSheetsManager:
     ) -> List[str]:
         normalized_payload = self._normalize_member_payload(payload)
         row = self._pad_row(existing_row, len(headers))
+        preserved_utc = self._get_existing_value(headers, row, "Datetime (UTC)")
 
-        current_time = datetime.now(pytz.timezone(config.TIMEZONE)).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-        added_at_value = normalized_payload.get("Added At") or self._get_existing_value(
-            headers,
-            row,
-            "Added At",
-        ) or current_time
-        first_name_value = normalized_payload.get("First Name") or self._get_existing_value(
-            headers,
-            row,
-            "First Name",
-        )
-        last_name_value = normalized_payload.get("Last Name") or self._get_existing_value(
-            headers,
-            row,
-            "Last Name",
-        )
-
-        base_values = {
-            "Username": normalized_payload.get("Username", self._get_existing_value(headers, row, "Username")),
-            "User ID": normalized_payload.get("User ID", self._get_existing_value(headers, row, "User ID")),
-            "Expiredate": normalized_payload.get(
-                "Expiredate",
-                self._get_existing_value(headers, row, "Expiredate"),
-            ),
-            "Added At": added_at_value,
-            "First Name": first_name_value,
-            "Last Name": last_name_value,
+        defaults = {
+            "Datetime (UTC)": normalized_payload.get(
+                "Datetime (UTC)",
+                preserved_utc or self._now_utc_string(),
+            )
         }
+        defaults.update(normalized_payload)
 
-        for header_name, header_value in base_values.items():
-            header_index = self._find_column_index(headers, header_name)
-            if header_index is not None:
-                row[header_index] = header_value
-
-        for header_name, header_value in normalized_payload.items():
+        for header_name, header_value in defaults.items():
             header_index = self._find_column_index(headers, header_name)
             if header_index is None:
                 continue
@@ -592,63 +814,11 @@ class GoogleSheetsManager:
 
         return row
 
-    def _delete_rows_by_user_ids(
-        self,
-        snapshot: SheetSnapshot,
-        user_ids: List[str],
-        *,
-        action_name: str,
-    ) -> List[str]:
-        row_numbers = []
-        removed_user_ids = []
-
-        for user_id in user_ids:
-            location = snapshot.member_locations.get(str(user_id))
-            if not location:
-                continue
-            row_numbers.append(location.row_number)
-            removed_user_ids.append(str(user_id))
-
-        self._delete_rows_by_numbers(row_numbers, action_name=action_name)
-        return removed_user_ids
-
-    def _delete_rows_by_numbers(self, row_numbers: List[int], *, action_name: str):
-        if not row_numbers:
-            return
-
-        requests = [
-            {
-                "deleteDimension": {
-                    "range": {
-                        "sheetId": self._get_sheet_id(),
-                        "dimension": "ROWS",
-                        "startIndex": row_number - 1,
-                        "endIndex": row_number,
-                    }
-                }
-            }
-            for row_number in sorted(set(row_numbers), reverse=True)
-        ]
-
-        chunk_size = max(1, int(config.GOOGLE_SHEETS_BATCH_CHUNK_SIZE))
-        for chunk_start in range(0, len(requests), chunk_size):
-            chunk = requests[chunk_start : chunk_start + chunk_size]
-            self._execute_write_request(
-                action_name=action_name,
-                execute_callable=lambda chunk=chunk: self.service.spreadsheets()
-                .batchUpdate(
-                    spreadsheetId=self.spreadsheet_id,
-                    body={"requests": chunk},
-                )
-                .execute(),
-                chunk_index=(chunk_start // chunk_size) + 1,
-                request_count=len(chunk),
-            )
-
     def _execute_value_batch_updates(
         self,
-        value_updates: List[Dict[str, object]],
         *,
+        worksheet_name: str,
+        value_updates: List[Dict[str, object]],
         action_name: str,
         **context_fields,
     ):
@@ -670,6 +840,7 @@ class GoogleSheetsManager:
                     },
                 )
                 .execute(),
+                worksheet_name=worksheet_name,
                 chunk_index=(chunk_start // chunk_size) + 1,
                 range_count=len(chunk),
                 **context_fields,
@@ -737,7 +908,6 @@ class GoogleSheetsManager:
         member_locations = {}
         user_id_index = self._find_column_index(headers, "User ID")
         if user_id_index is None:
-            logger.error("Header 'User ID' not found in worksheet %s", self.worksheet_name)
             return member_locations
 
         for row_number, row_values in enumerate(rows[1:], start=2):
@@ -751,25 +921,31 @@ class GoogleSheetsManager:
             )
         return member_locations
 
-    def _get_sheet_id(self) -> int:
-        if self._sheet_id_cache is not None:
-            return self._sheet_id_cache
+    def _get_sheet_id(self, worksheet_name: str) -> int:
+        self._ensure_worksheet_exists(worksheet_name)
+        return self._sheet_id_cache[worksheet_name]
 
-        spreadsheet = self.service.spreadsheets().get(
-            spreadsheetId=self.spreadsheet_id,
-        ).execute()
-        for sheet in spreadsheet.get("sheets", []):
-            properties = sheet.get("properties", {})
-            if properties.get("title") == self.worksheet_name:
-                self._sheet_id_cache = properties["sheetId"]
-                return self._sheet_id_cache
-
-        raise ValueError(f"Worksheet '{self.worksheet_name}' not found")
-
-    def _build_row_range(self, row_number: int, last_column_index: int) -> str:
+    def _build_row_range(
+        self,
+        *,
+        worksheet_name: str,
+        row_number: int,
+        last_column_index: int,
+    ) -> str:
         return (
-            f"{self.worksheet_name}!A{row_number}:"
+            f"{worksheet_name}!A{row_number}:"
             f"{self._column_letter(last_column_index)}{row_number}"
+        )
+
+    def _update_single_field(
+        self,
+        user_id: str,
+        header_name: str,
+        new_value: str,
+    ) -> bool:
+        return self.update_member_fields(
+            user_id=user_id,
+            field_values={header_name: new_value},
         )
 
     @staticmethod
@@ -823,3 +999,28 @@ class GoogleSheetsManager:
             sanitized_value = str(value).replace(" ", "_")
             parts.append(f"{key}={sanitized_value}")
         return " ".join(parts)
+
+    @classmethod
+    def _is_member_active(cls, member: Dict[str, str]) -> bool:
+        record_status = member.get("Record Status", "").strip().lower()
+        in_group_now = member.get("In Group Now", "").strip().lower()
+        return (
+            record_status in cls.ACTIVE_RECORD_STATUSES
+            and in_group_now in cls.ACTIVE_IN_GROUP_VALUES
+        )
+
+    @staticmethod
+    def _serialize_audit_value(value) -> str:
+        if value is None or value == "":
+            return ""
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+    @staticmethod
+    def _now_local_string() -> str:
+        return datetime.now(pytz.timezone(config.TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _now_utc_string() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")

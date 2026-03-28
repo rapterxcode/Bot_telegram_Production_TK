@@ -32,18 +32,26 @@ class FakeSheetsManager:
         self.members = list(members)
         self.bulk_sync_calls = []
 
-    def get_all_members(self):
+    def get_all_members(self, include_inactive=False):
+        del include_inactive
         return list(self.members)
 
     def get_expired_members(self):
         return []
 
-    def bulk_sync_members(self, member_payloads, remove_user_ids=None, required_headers=None):
+    def bulk_sync_members(
+        self,
+        member_payloads,
+        remove_user_ids=None,
+        required_headers=None,
+        removal_payloads=None,
+    ):
         self.bulk_sync_calls.append(
             {
                 "member_payloads": list(member_payloads),
                 "remove_user_ids": list(remove_user_ids or []),
                 "required_headers": list(required_headers or []),
+                "removal_payloads": list(removal_payloads or []),
             }
         )
 

@@ -25,8 +25,15 @@ class FakeValuesResource:
         self.service = service
 
     def get(self, spreadsheetId, range):
-        del spreadsheetId, range
-        return FakeExecute(lambda: {"values": copy.deepcopy(self.service.values)})
+        del spreadsheetId
+        worksheet_name = range.split("!", 1)[0]
+        return FakeExecute(
+            lambda: {
+                "values": copy.deepcopy(
+                    self.service.sheet_values.get(worksheet_name, [])
+                )
+            }
+        )
 
     def update(self, spreadsheetId, range, valueInputOption, body):
         del spreadsheetId, valueInputOption
@@ -57,10 +64,11 @@ class FakeSpreadsheetsResource:
                 "sheets": [
                     {
                         "properties": {
-                            "title": self.service.worksheet_name,
-                            "sheetId": self.service.sheet_id,
+                            "title": worksheet_name,
+                            "sheetId": sheet_id,
                         }
                     }
+                    for worksheet_name, sheet_id in self.service.sheet_ids.items()
                 ]
             }
         )
@@ -90,6 +98,10 @@ class FakeGoogleSheetsService:
         self.update_attempts = 0
         self.batch_attempts = 0
         self.values_batch_attempts = 0
+        self.primary_worksheet_name = worksheet_name
+        self.values = copy.deepcopy(values)
+        self.sheet_values = {worksheet_name: self.values}
+        self.sheet_ids = {worksheet_name: sheet_id}
 
     def spreadsheets(self):
         return FakeSpreadsheetsResource(self)
@@ -123,13 +135,24 @@ class FakeGoogleSheetsService:
 
         self.last_batch_request = copy.deepcopy(body)
         for request in body["requests"]:
-            delete_range = request["deleteDimension"]["range"]
-            start_index = delete_range["startIndex"]
-            del self.values[start_index]
+            if "deleteDimension" in request:
+                delete_range = request["deleteDimension"]["range"]
+                start_index = delete_range["startIndex"]
+                target_sheet_id = delete_range["sheetId"]
+                worksheet_name = self.sheet_name_from_id(target_sheet_id)
+                del self.sheet_values[worksheet_name][start_index]
+                continue
+
+            if "addSheet" in request:
+                title = request["addSheet"]["properties"]["title"]
+                if title not in self.sheet_values:
+                    next_sheet_id = max(self.sheet_ids.values(), default=0) + 1
+                    self.sheet_values[title] = []
+                    self.sheet_ids[title] = next_sheet_id
         return {}
 
     def apply_update(self, range_name, rows):
-        _, coordinates = range_name.split("!", 1)
+        worksheet_name, coordinates = range_name.split("!", 1)
         if ":" in coordinates:
             start_cell, _ = coordinates.split(":", 1)
         else:
@@ -139,20 +162,28 @@ class FakeGoogleSheetsService:
         column_index = self.column_to_index(match.group(1))
         row_index = int(match.group(2)) - 1
 
-        while len(self.values) <= row_index:
-            self.values.append([])
+        target_values = self.sheet_values.setdefault(worksheet_name, [])
 
-        row_values = self.values[row_index]
-        target_values = rows[0]
+        while len(target_values) <= row_index:
+            target_values.append([])
+
+        row_values = target_values[row_index]
+        new_values = rows[0]
 
         while len(row_values) < column_index:
             row_values.append("")
 
-        for offset, value in enumerate(target_values):
+        for offset, value in enumerate(new_values):
             absolute_index = column_index + offset
             while len(row_values) <= absolute_index:
                 row_values.append("")
             row_values[absolute_index] = value
+
+    def sheet_name_from_id(self, target_sheet_id):
+        for worksheet_name, sheet_id in self.sheet_ids.items():
+            if sheet_id == target_sheet_id:
+                return worksheet_name
+        raise KeyError(target_sheet_id)
 
     @staticmethod
     def column_to_index(column_letters):
@@ -164,6 +195,16 @@ class FakeGoogleSheetsService:
 
 class GoogleSheetsManagerTests(unittest.TestCase):
     """Verify sheet writes are clean and deterministic."""
+
+    @staticmethod
+    def row_to_dict(headers, row):
+        padded_row = list(row)
+        if len(padded_row) < len(headers):
+            padded_row.extend([""] * (len(headers) - len(padded_row)))
+        return {
+            header: padded_row[index]
+            for index, header in enumerate(headers)
+        }
 
     def test_add_member_with_details_inserts_new_row(self):
         service = FakeGoogleSheetsService(
@@ -180,11 +221,14 @@ class GoogleSheetsManagerTests(unittest.TestCase):
         )
 
         self.assertTrue(success)
-        self.assertEqual(service.values[1][0], "@alice")
-        self.assertEqual(service.values[1][1], "123")
-        self.assertEqual(service.values[1][2], "2026-04-01 10:00:00")
-        self.assertEqual(service.values[1][4], "Alice")
-        self.assertEqual(service.values[1][5], "Example")
+        row = self.row_to_dict(service.values[0], service.values[1])
+        self.assertEqual(row["Username"], "@alice")
+        self.assertEqual(row["User ID"], "123")
+        self.assertEqual(row["Expiredate"], "2026-04-01 10:00:00")
+        self.assertEqual(row["First Name"], "Alice")
+        self.assertEqual(row["Last Name"], "Example")
+        self.assertEqual(row["Record Status"], "active")
+        self.assertEqual(row["In Group Now"], "Yes")
 
     def test_add_member_with_details_updates_existing_user_id(self):
         service = FakeGoogleSheetsService(
@@ -205,11 +249,13 @@ class GoogleSheetsManagerTests(unittest.TestCase):
 
         self.assertTrue(success)
         self.assertEqual(len(service.values), 2)
-        self.assertEqual(service.values[1][0], "@new")
-        self.assertEqual(service.values[1][2], "2026-04-01 10:00:00")
-        self.assertEqual(service.values[1][3], "2024-01-01 00:00:00")
-        self.assertEqual(service.values[1][4], "New")
-        self.assertEqual(service.values[1][5], "Person")
+        row = self.row_to_dict(service.values[0], service.values[1])
+        self.assertEqual(row["Username"], "@new")
+        self.assertEqual(row["Expiredate"], "2026-04-01 10:00:00")
+        self.assertEqual(row["Added At"], "2024-01-01 00:00:00")
+        self.assertEqual(row["First Name"], "New")
+        self.assertEqual(row["Last Name"], "Person")
+        self.assertNotEqual(row["Datetime (UTC)"], "")
 
     def test_remove_member_from_sheet_uses_runtime_sheet_id(self):
         service = FakeGoogleSheetsService(
@@ -221,14 +267,32 @@ class GoogleSheetsManagerTests(unittest.TestCase):
         )
         manager = GoogleSheetsManager(service=service, spreadsheet_id="sheet-1")
 
-        success = manager.remove_member_from_sheet("123")
+        success = manager.remove_member_from_sheet(
+            "123",
+            remove_reason="Left Telegram group",
+            actor="@system",
+            source="chat_member_update",
+            note="Telegram reported that the member left the group",
+        )
 
         self.assertTrue(success)
-        self.assertEqual(
-            service.last_batch_request["requests"][0]["deleteDimension"]["range"]["sheetId"],
-            99,
+        member_row = self.row_to_dict(service.values[0], service.values[1])
+        self.assertEqual(member_row["Record Status"], "removed")
+        self.assertEqual(member_row["In Group Now"], "No")
+        self.assertEqual(member_row["Remove Reason"], "Left Telegram group")
+        self.assertEqual(member_row["Sync Source"], "chat_member_update")
+        self.assertNotEqual(member_row["Removed At"], "")
+
+        audit_headers = service.sheet_values["audit_logs"][0]
+        audit_row = self.row_to_dict(
+            audit_headers,
+            service.sheet_values["audit_logs"][1],
         )
-        self.assertEqual(len(service.values), 1)
+        self.assertEqual(audit_row["User ID"], "123")
+        self.assertEqual(audit_row["Action"], "member_removed")
+        self.assertEqual(audit_row["Actor"], "@system")
+        self.assertEqual(audit_row["Source"], "chat_member_update")
+        self.assertIn("Left Telegram group", audit_row["New Value"])
 
     def test_ensure_headers_appends_sync_columns(self):
         service = FakeGoogleSheetsService(
@@ -241,9 +305,8 @@ class GoogleSheetsManagerTests(unittest.TestCase):
         self.assertIn("Role", headers)
         self.assertIn("Sync Note", headers)
         self.assertIn("Sync Source", headers)
-        self.assertEqual(service.values[0][6], "Role")
-        self.assertEqual(service.values[0][7], "Sync Note")
-        self.assertEqual(service.values[0][8], "Sync Source")
+        self.assertEqual(service.values[0], headers)
+        self.assertTrue(set(manager.MEMBER_HEADERS).issubset(set(headers)))
 
     def test_update_member_fields_updates_row_once(self):
         service = FakeGoogleSheetsService(
@@ -272,9 +335,10 @@ class GoogleSheetsManagerTests(unittest.TestCase):
         )
 
         self.assertTrue(success)
-        self.assertEqual(service.values[1][6], "admin")
-        self.assertEqual(service.values[1][7], "Verified")
-        self.assertEqual(service.values[1][8], "bot_api_sync")
+        row = self.row_to_dict(service.values[0], service.values[1])
+        self.assertEqual(row["Role"], "admin")
+        self.assertEqual(row["Sync Note"], "Verified")
+        self.assertEqual(row["Sync Source"], "bot_api_sync")
         self.assertEqual(service.values_batch_attempts, 1)
 
     def test_bulk_sync_members_batches_updates_and_deletes(self):
@@ -327,11 +391,22 @@ class GoogleSheetsManagerTests(unittest.TestCase):
         self.assertEqual(result["updated_user_ids"], ["111"])
         self.assertEqual(result["removed_user_ids"], ["222"])
         self.assertEqual(service.values_batch_attempts, 1)
-        self.assertEqual(service.batch_attempts, 1)
-        self.assertEqual(service.values[1][1], "111")
-        self.assertEqual(service.values[1][6], "member")
-        self.assertEqual(service.values[2][1], "333")
-        self.assertEqual(service.values[2][8], "bot_api_admin_backfill")
+        self.assertEqual(service.batch_attempts, 0)
+
+        member_rows = {
+            row_dict["User ID"]: row_dict
+            for row_dict in (
+                self.row_to_dict(service.values[0], row)
+                for row in service.values[1:]
+            )
+        }
+        self.assertEqual(member_rows["111"]["Telegram Status"], "member")
+        self.assertEqual(member_rows["111"]["Role"], "member")
+        self.assertEqual(member_rows["111"]["Sync Source"], "bot_api_sync")
+        self.assertEqual(member_rows["222"]["Record Status"], "removed")
+        self.assertEqual(member_rows["222"]["In Group Now"], "No")
+        self.assertEqual(member_rows["333"]["Role"], "admin")
+        self.assertEqual(member_rows["333"]["Sync Source"], "bot_api_admin_backfill")
 
     def test_write_operations_retry_after_transient_failure(self):
         original_retry_count = config.GOOGLE_SHEETS_WRITE_RETRY_COUNT

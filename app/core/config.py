@@ -58,9 +58,10 @@ GROUP_CHAT_ID_FOR_ADMIN = int(os.getenv("GROUP_CHAT_ID_FOR_ADMIN", 0))
 GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID")
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "credentials.json")
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Members")
+AUDIT_WORKSHEET_NAME = os.getenv("AUDIT_WORKSHEET_NAME", "audit_logs")
 BOT_STATE_FILE = os.getenv("BOT_STATE_FILE", "data/bot_state.json")
 
-SHEET_RANGE = f"{WORKSHEET_NAME}!A:F"
+SHEET_RANGE = f"{WORKSHEET_NAME}!A:Z"
 
 REQUIRED_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",

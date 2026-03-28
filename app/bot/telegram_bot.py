@@ -467,7 +467,13 @@ class TelegramMemberBot(
                         chat_id=target_group_id,
                         user_id=int(user_id),
                     )
-                    self.sheets_manager.remove_member_from_sheet(user_id)
+                    self.sheets_manager.remove_member_from_sheet(
+                        user_id,
+                        remove_reason="Membership expired",
+                        actor="system",
+                        source="expired_member_cleanup",
+                        note="Automatically removed because membership expired",
+                    )
 
                     logger.info("Removed expired member: %s (ID: %s)", username, user_id)
 
@@ -490,7 +496,13 @@ class TelegramMemberBot(
                 except BadRequest as exc:
                     if "User not found" in str(exc):
                         logger.info("User %s already left the group", user_id)
-                        self.sheets_manager.remove_member_from_sheet(user_id)
+                        self.sheets_manager.remove_member_from_sheet(
+                            user_id,
+                            remove_reason="User already left group before expiry cleanup",
+                            actor="system",
+                            source="expired_member_cleanup",
+                            note="Marked removed during expiry cleanup because user was already absent",
+                        )
                     else:
                         logger.error("Error removing user %s: %s", user_id, exc)
                 except Exception as exc:

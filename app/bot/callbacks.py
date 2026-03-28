@@ -14,6 +14,42 @@ logger = logging.getLogger(__name__)
 class ApprovalCallbacksMixin:
     """Encapsulate admin callback flows for approval and rejection."""
 
+    @staticmethod
+    def _format_actor_label(actor_user) -> str:
+        """Build a compact actor label for audit fields."""
+        if not actor_user:
+            return ""
+        if getattr(actor_user, "username", None):
+            return f"@{actor_user.username}"
+        full_name = " ".join(
+            part for part in [actor_user.first_name, actor_user.last_name] if part
+        ).strip()
+        return full_name or f"user_{actor_user.id}"
+
+    def _append_member_audit_log(
+        self,
+        *,
+        user_id: str,
+        username: str,
+        action: str,
+        old_value="",
+        new_value="",
+        actor: str = "",
+        source: str = "",
+        note: str = "",
+    ):
+        """Write a best-effort member audit log entry."""
+        self.sheets_manager.append_audit_log(
+            user_id=user_id,
+            username=username,
+            action=action,
+            old_value=old_value,
+            new_value=new_value,
+            actor=actor,
+            source=source,
+            note=note,
+        )
+
     async def handle_approval_callback(
         self,
         update: Update,
@@ -101,6 +137,7 @@ class ApprovalCallbacksMixin:
             return
 
         try:
+            actor_label = self._format_actor_label(query.from_user)
             await context.bot.approve_chat_join_request(
                 chat_id=chat_id,
                 user_id=int(member_user_id),
@@ -112,11 +149,41 @@ class ApprovalCallbacksMixin:
                 expire_date_str,
                 first_name,
                 last_name,
+                metadata={
+                    "Role": "member",
+                    "Telegram Status": "member",
+                    "Record Status": "active",
+                    "In Group Now": "Yes",
+                    "Join Source": member_info.get("join_source", "join_request"),
+                    "Invite Link Label": member_info.get("invite_link_label", ""),
+                    "Expire Policy Days": member_info.get("expire_policy_days", ""),
+                    "Joined At": self.sheets_manager._now_local_string(),
+                    "Approved By": actor_label,
+                    "Approved At": self.sheets_manager._now_local_string(),
+                    "Added By": actor_label,
+                    "Last Seen In Group At": self.sheets_manager._now_local_string(),
+                    "Last Sync Result": "approved_join_request",
+                    "Sync Note": "Approved from Telegram join request",
+                    "Sync Source": "callback_join_request_approval",
+                },
             )
 
             if success:
                 self.discard_pending_member(member_user_id)
                 self.clear_notification_sent(f"join_request_{member_user_id}")
+                self._append_member_audit_log(
+                    user_id=member_user_id,
+                    username=username,
+                    action="approved_join_request",
+                    new_value={
+                        "Join Source": member_info.get("join_source", "join_request"),
+                        "Expiredate": expire_date_str,
+                        "Approved By": actor_label,
+                    },
+                    actor=actor_label,
+                    source="callback_join_request_approval",
+                    note="Approved a pending join request and wrote member record",
+                )
 
                 await query.edit_message_text(
                     "อนุมัติคำขอเข้าร่วมสำเร็จ\n\n"
@@ -161,17 +228,46 @@ class ApprovalCallbacksMixin:
         last_name: str,
         expire_date_str: str,
     ):
+        actor_label = self._format_actor_label(query.from_user)
         success = self.sheets_manager.add_member_with_details(
             username,
             member_user_id,
             expire_date_str,
             first_name,
             last_name,
+            metadata={
+                "Role": "member",
+                "Telegram Status": "member",
+                "Record Status": "active",
+                "In Group Now": "Yes",
+                "Join Source": "member_update",
+                "Invite Link Label": "",
+                "Expire Policy Days": "",
+                "Approved By": actor_label,
+                "Approved At": self.sheets_manager._now_local_string(),
+                "Added By": actor_label,
+                "Last Seen In Group At": self.sheets_manager._now_local_string(),
+                "Last Sync Result": "approved_member_update",
+                "Sync Note": "Approved a member already present in the group",
+                "Sync Source": "callback_member_approval",
+            },
         )
 
         if success:
             self.discard_pending_member(member_user_id)
             self.clear_notification_sent(f"member_update_{member_user_id}")
+            self._append_member_audit_log(
+                user_id=member_user_id,
+                username=username,
+                action="approved_member_update",
+                new_value={
+                    "Expiredate": expire_date_str,
+                    "Approved By": actor_label,
+                },
+                actor=actor_label,
+                source="callback_member_approval",
+                note="Approved a member record from pending member update",
+            )
 
             await query.edit_message_text(
                 "อนุมัติสมาชิกสำเร็จ\n\n"
@@ -205,6 +301,7 @@ class ApprovalCallbacksMixin:
             return
 
         try:
+            actor_label = self._format_actor_label(query.from_user)
             await context.bot.decline_chat_join_request(
                 chat_id=chat_id,
                 user_id=int(member_user_id),
@@ -216,6 +313,15 @@ class ApprovalCallbacksMixin:
 
             self.discard_pending_member(member_user_id)
             self.clear_notification_sent(f"join_request_{member_user_id}")
+            self._append_member_audit_log(
+                user_id=member_user_id,
+                username=username,
+                action="rejected_join_request",
+                old_value=member_info,
+                actor=actor_label,
+                source="callback_join_request_rejection",
+                note="Rejected a Telegram join request",
+            )
 
             await query.edit_message_text(
                 "ปฏิเสธคำขอเข้าร่วมสำเร็จ\n\n"
@@ -251,6 +357,7 @@ class ApprovalCallbacksMixin:
         target_group_id = self.group_chat_id or config.GROUP_CHAT_ID
 
         try:
+            actor_label = self._format_actor_label(query.from_user)
             bot_member = await context.bot.get_chat_member(
                 target_group_id,
                 context.bot.id,
@@ -273,8 +380,33 @@ class ApprovalCallbacksMixin:
                 user_id=int(member_user_id),
             )
 
+            existing_member = self.sheets_manager.get_member_record(
+                member_user_id,
+                include_inactive=True,
+            )
             self.discard_pending_member(member_user_id)
             self.clear_notification_sent(f"member_update_{member_user_id}")
+            self.sheets_manager.remove_member_from_sheet(
+                member_user_id,
+                remove_reason="Rejected during pending member approval",
+                actor=actor_label,
+                source="callback_member_rejection",
+                note="Member was removed from the group after rejection",
+            )
+            self._append_member_audit_log(
+                user_id=member_user_id,
+                username=username,
+                action="rejected_member_update",
+                old_value=existing_member or {},
+                new_value={
+                    "Record Status": "removed",
+                    "In Group Now": "No",
+                    "Remove Reason": "Rejected during pending member approval",
+                },
+                actor=actor_label,
+                source="callback_member_rejection",
+                note="Rejected a pending member and removed them from the group",
+            )
 
             await query.edit_message_text(
                 "ปฏิเสธสมาชิกสำเร็จ\n\n"

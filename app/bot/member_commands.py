@@ -23,6 +23,18 @@ UNIT_DISPLAY = {
 class MemberManagementMixin:
     """Encapsulate member-management and admin utility commands."""
 
+    @staticmethod
+    def _format_actor_label(actor_user) -> str:
+        """Build a compact actor label for audit fields."""
+        if not actor_user:
+            return ""
+        if getattr(actor_user, "username", None):
+            return f"@{actor_user.username}"
+        full_name = " ".join(
+            part for part in [actor_user.first_name, actor_user.last_name] if part
+        ).strip()
+        return full_name or f"user_{actor_user.id}"
+
     async def add_member_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         admin_group_id = config.GROUP_CHAT_ID_FOR_ADMIN
         if admin_group_id:
@@ -54,6 +66,7 @@ class MemberManagementMixin:
             username = context.args[0]
             member_user_id = context.args[1]
             expire_date = " ".join(context.args[2:])
+            actor_label = self._format_actor_label(update.effective_user)
 
             if not username.startswith("@"):
                 username = f"@{username}"
@@ -107,9 +120,36 @@ class MemberManagementMixin:
                 )
                 return
 
-            success = self.sheets_manager.add_member(username, member_user_id, expire_date)
+            success = self.sheets_manager.add_member_with_details(
+                username,
+                member_user_id,
+                expire_date,
+                metadata={
+                    "Record Status": "invited",
+                    "In Group Now": "No",
+                    "Join Source": "admin_invite",
+                    "Invite Link Label": "manual_admin_invite",
+                    "Added By": actor_label,
+                    "Last Sync Result": "invite_sent",
+                    "Sync Note": "Manual invite link was created and sent by admin",
+                    "Sync Source": "manual_addmember",
+                },
+            )
 
             if success:
+                self.sheets_manager.append_audit_log(
+                    user_id=member_user_id,
+                    username=username,
+                    action="member_invited",
+                    new_value={
+                        "Username": username,
+                        "User ID": member_user_id,
+                        "Expiredate": expire_date,
+                    },
+                    actor=actor_label,
+                    source="manual_addmember",
+                    note="Admin created a one-time invite link for a member",
+                )
                 await context.bot.send_message(
                     chat_id=admin_group_id,
                     text=(
@@ -169,7 +209,7 @@ class MemberManagementMixin:
                 )
                 return
 
-            members = self.sheets_manager.get_all_members()
+            members = self.sheets_manager.get_all_members(include_inactive=True)
             member_info = None
             for member in members:
                 if member.get("User ID") == member_user_id:
@@ -195,7 +235,14 @@ class MemberManagementMixin:
                     user_id=int(member_user_id),
                 )
 
-                sheet_success = self.sheets_manager.remove_member_from_sheet(member_user_id)
+                actor_label = self._format_actor_label(update.effective_user)
+                sheet_success = self.sheets_manager.remove_member_from_sheet(
+                    member_user_id,
+                    remove_reason="Removed manually by admin",
+                    actor=actor_label,
+                    source="manual_remove_command",
+                    note="Removed through /removemember",
+                )
 
                 if sheet_success:
                     await context.bot.send_message(
@@ -230,7 +277,14 @@ class MemberManagementMixin:
                 )
             except BadRequest as exc:
                 if "User not found" in str(exc):
-                    sheet_success = self.sheets_manager.remove_member_from_sheet(member_user_id)
+                    actor_label = self._format_actor_label(update.effective_user)
+                    sheet_success = self.sheets_manager.remove_member_from_sheet(
+                        member_user_id,
+                        remove_reason="User already left group before manual removal",
+                        actor=actor_label,
+                        source="manual_remove_command",
+                        note="Sheet record marked removed because Telegram user was already absent",
+                    )
                     if sheet_success:
                         await context.bot.send_message(
                             chat_id=admin_group_id,
@@ -447,7 +501,7 @@ class MemberManagementMixin:
                 )
                 return
 
-            members = self.sheets_manager.get_all_members()
+            members = self.sheets_manager.get_all_members(include_inactive=True)
             member_info = None
             for member in members:
                 if member.get("User ID") == member_user_id:

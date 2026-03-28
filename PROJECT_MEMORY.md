@@ -65,7 +65,7 @@ requirements.txt
 - `app/bot/reconciliation.py`: group/sheet reconciliation helpers and `/syncmembers`.
 - `app/bot/invites.py`: invite-link creation and cleanup.
 - `app/bot/notifications.py`: admin notification helpers.
-- `app/services/google_sheets.py`: Google Sheets reads, upserts by `User ID`, deletes, and field updates, including sync metadata columns.
+- `app/services/google_sheets.py`: Google Sheets reads, upserts by `User ID`, performs soft-removal, writes sync metadata, and appends worksheet audit logs.
 - `app/services/state_store.py`: JSON persistence for runtime bot state.
 
 ## Runtime Flow
@@ -96,15 +96,16 @@ requirements.txt
 
 - `/syncmembers` verifies every `User ID` already known in Google Sheets against the current Telegram group.
 - Bot API member lookups are now concurrency-limited instead of fully serial.
-- During sync, rows missing from the Telegram group are removed from the sheet.
-- Active rows are refreshed with extra metadata columns such as Telegram status, role, in-group flag, sync note, and last sync time.
-- Google Sheets sync writes are now diffed in memory and written back with batched value updates and batched row deletes.
+- During sync, rows missing from the Telegram group are soft-removed instead of being physically deleted.
+- Active rows are refreshed with richer metadata such as Telegram status, role, join source, approval fields, sync result, removal fields, and last-seen markers.
+- Google Sheets sync writes are now diffed in memory and written back with batched value updates.
 - When enabled, admins currently in Telegram but missing from the sheet are auto-added with a configurable backfill expiry value.
 - `/status` now prefers the latest persisted sync snapshot for a faster response.
 - `/statuslive` forces a fresh live lookup when an admin wants to bypass the cached snapshot.
 - `/fullsyncmembers` uses an optional Telethon user session to enumerate the full group membership and reconcile the sheet exactly.
 - Admins currently in Telegram but missing from the sheet are either auto-added or reported in sync/status output depending on config.
 - The implementation uses Bot API methods such as member count, admin list, and per-user lookups.
+- Member lifecycle audit entries are also written to a dedicated `audit_logs` worksheet.
 
 ### Join / Approval Flow
 
@@ -137,38 +138,57 @@ Notes:
 
 ## Google Sheet Contract
 
-Required headers used by the code:
+Primary worksheet: `Members`
+
+Member columns written by the bot:
 
 - `Username`
 - `User ID`
-- `Expiredate`
-
-Columns written by the bot:
-
-- A = `Username`
-- B = `User ID`
-- C = `Expiredate`
-- D = created timestamp
-- E = `First Name`
-- F = `Last Name`
-
-Additional optional metadata columns may be created automatically:
-
-- `Telegram Status`
+- `First Name`
+- `Last Name`
 - `Role`
+- `Telegram Status`
+- `Record Status`
 - `In Group Now`
-- `Sync Note`
+- `Join Source`
+- `Invite Link Label`
+- `Expire Policy Days`
+- `Expiredate`
+- `Joined At`
+- `Approved By`
+- `Approved At`
+- `Added By`
+- `Datetime (UTC)`
 - `Last Sync At`
+- `Last Sync Result`
+- `Sync Note`
+- `Last Seen In Group At`
+- `Removed At`
+- `Remove Reason`
 - `Sync Source`
+
+Audit worksheet: `audit_logs`
+
+Audit columns written by the bot:
+
+- `Event Time`
+- `User ID`
+- `Username`
+- `Action`
+- `Old Value`
+- `New Value`
+- `Actor`
+- `Source`
+- `Note`
 
 Current behavior:
 
 - member writes are upserts keyed by `User ID`
 - duplicate writes become no-ops when the row already matches
 - sync writes batch row updates with `spreadsheets.values.batchUpdate(...)`
-- sync deletes batch row removals with a single `spreadsheets().batchUpdate(...)` request chunk
-- deletes now resolve the real worksheet `sheetId` from spreadsheet metadata instead of hardcoding `0`
-- sync metadata headers are appended automatically when missing
+- removals now update status fields in place instead of deleting the row
+- member and audit worksheet headers are initialized automatically when missing
+- audit events are appended for joins, approvals, manual removals, and sync-driven removal marks
 
 ## Environment Variables In Use
 
@@ -179,6 +199,7 @@ Current behavior:
 - `GOOGLE_SHEETS_ID`
 - `GOOGLE_SERVICE_ACCOUNT_FILE`
 - `WORKSHEET_NAME`
+- `AUDIT_WORKSHEET_NAME`
 - `TIMEZONE`
 - `BOT_STATE_FILE`
 - `CHECK_INTERVAL_VALUE`
