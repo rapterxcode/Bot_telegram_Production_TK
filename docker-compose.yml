@@ -1,6 +1,9 @@
 services:
   tksignal-bot:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
     container_name: ${COMPOSE_CONTAINER_NAME:-tksignal-bot}
     restart: ${COMPOSE_RESTART_POLICY:-unless-stopped}
 
@@ -16,6 +19,7 @@ services:
     volumes:
       - ./credentials.json:/app/credentials.json:ro
       - ./logs:/app/logs
+      - ./data:/app/data
 
     healthcheck:
       test:

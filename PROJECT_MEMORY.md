@@ -67,6 +67,8 @@ requirements.txt
 - `app/bot/notifications.py`: admin notification helpers.
 - `app/services/google_sheets.py`: Google Sheets reads, upserts by `User ID`, deletes, and field updates, including sync metadata columns.
 - `app/services/state_store.py`: JSON persistence for runtime bot state.
+- `Dockerfile`: multi-stage container build with separate builder/runtime stages on `python:3.11-slim`.
+- `docker-compose.yml`: main compose entry for the bot container and optional Watchtower sidecar.
 
 ## Runtime Flow
 
@@ -76,6 +78,15 @@ requirements.txt
 - `app.main.main()` creates `TelegramMemberBot` and awaits `bot.run()`.
 - `TelegramMemberBot.__init__()` loads persisted runtime state from `BOT_STATE_FILE` (default `data/bot_state.json`).
 - `TelegramMemberBot.run()` builds the Telegram application, registers handlers, schedules the expired-member job, initializes the app, and starts polling.
+
+### Container Build
+
+- `Dockerfile` now uses a multi-stage build:
+  - `builder`: creates a virtualenv and installs Python dependencies with build tools available
+  - `runtime`: copies only the virtualenv and application source into a slimmer final image
+- The runtime image keeps the existing `python -m app.main` entrypoint and Telegram healthcheck.
+- The runtime image now creates `/app/logs` and `/app/data` for log/state/session files.
+- `docker-compose.yml` now builds the explicit `runtime` stage and mounts `./data:/app/data` so persisted state and Telethon session files survive container recreation.
 
 ### Polling
 
@@ -236,6 +247,8 @@ python -m unittest discover -s tests
 - Scheduler startup is now wired automatically.
 - Polling `allowed_updates` is explicit for the events the bot relies on.
 - Runtime bot state survives restarts through local JSON persistence, and the path is now configurable.
+- Docker build now uses a multi-stage `builder` + `runtime` pattern and a Python 3.11 slim base image.
+- Docker Compose now persists `/app/data` to the host `./data` directory.
 - Join-request approvals can continue after restart because `chat_id` is persisted.
 - Pending-list callback buttons now preserve join-request vs member-update flow.
 - Google Sheets writes are now upserts by `User ID`.
