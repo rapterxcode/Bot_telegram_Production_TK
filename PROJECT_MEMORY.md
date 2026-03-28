@@ -10,7 +10,7 @@
 
 - This project is a Telegram bot for semi-automated group member management.
 - Member data is stored in Google Sheets.
-- The bot supports admin-driven member adds, invite links, join-request approval, and expired-member cleanup.
+- The bot supports admin-driven member adds, invite links, join-request approval, soft-removal tracking, member audit logging, and expired-member cleanup.
 - Runtime state that must survive restarts is now persisted locally.
 
 ## Current Structure
@@ -100,12 +100,13 @@ requirements.txt
 - Active rows are refreshed with richer metadata such as Telegram status, role, join source, approval fields, sync result, removal fields, and last-seen markers.
 - Google Sheets sync writes are now diffed in memory and written back with batched value updates.
 - When enabled, admins currently in Telegram but missing from the sheet are auto-added with a configurable backfill expiry value.
-- `/status` now prefers the latest persisted sync snapshot for a faster response.
-- `/statuslive` forces a fresh live lookup when an admin wants to bypass the cached snapshot.
+- `/status` prefers the latest persisted sync snapshot when `STATUS_USE_CACHED_SNAPSHOT=true`; otherwise it falls back to a fresh live lookup.
+- `/statuslive` always forces a fresh live lookup when an admin wants to bypass the cached snapshot.
 - `/fullsyncmembers` uses an optional Telethon user session to enumerate the full group membership and reconcile the sheet exactly.
 - Admins currently in Telegram but missing from the sheet are either auto-added or reported in sync/status output depending on config.
 - The implementation uses Bot API methods such as member count, admin list, and per-user lookups.
 - Member lifecycle audit entries are also written to a dedicated `audit_logs` worksheet.
+- The status snapshot includes `possible_untracked_group_members` because Bot API live checks still cannot enumerate every unknown non-admin member directly.
 
 ### Join / Approval Flow
 
@@ -115,11 +116,19 @@ requirements.txt
   - join requests
   - direct member additions that still need admin review
 - Pending-list buttons now preserve whether a record is a join request or a member update.
+- Re-joining with the same `User ID` reuses the existing sheet row through upsert logic and reactivates the member record instead of creating a duplicate active row.
 
 ### Direct Add Flow
 
 - If an admin adds a member directly in Telegram, `handle_chat_member_update()` auto-adds that member to Google Sheets with the default expiry.
 - If a non-admin-driven member update needs approval, it is stored in pending state and sent to the admin group.
+
+### Removal / Expiry Flow
+
+- `check_expired_members()` still removes expired active members from the Telegram group using ban/unban and then marks the sheet row as removed.
+- If an expired user already left the group before cleanup runs, the sheet row is still marked removed with an expiry-related reason.
+- `handle_chat_member_update()` now also records real-time leave/kick transitions and writes audit entries such as `member_left_group` and `member_kicked_from_group`.
+- A removed member can later rejoin through invite/join approval; the same row is updated back to active with a new expiry policy/date.
 
 ## Runtime State
 
@@ -187,8 +196,10 @@ Current behavior:
 - duplicate writes become no-ops when the row already matches
 - sync writes batch row updates with `spreadsheets.values.batchUpdate(...)`
 - removals now update status fields in place instead of deleting the row
+- `get_all_members()` returns active members by default; inactive/history rows remain available when explicitly requested
+- the same `User ID` can move between invited/active/removed states over time in a single persistent row
 - member and audit worksheet headers are initialized automatically when missing
-- audit events are appended for joins, approvals, manual removals, and sync-driven removal marks
+- audit events are appended for joins, approvals, manual removals, leave/kick updates, expiry cleanup, and sync-driven removal marks
 
 ## Environment Variables In Use
 
@@ -226,6 +237,7 @@ Notes:
 - `ADMIN_USER_ID` supports multiple comma-separated IDs.
 - `SYNC_BACKFILL_EXPIREDATE` also accepts the legacy env name `TELETHON_FULL_SYNC_BACKFILL_EXPIREDATE`.
 - Telethon full sync remains optional and only activates when the Telethon env vars are configured.
+- `AUDIT_WORKSHEET_NAME` defaults to `audit_logs`.
 
 ## Logging
 
@@ -242,7 +254,7 @@ Smoke tests now exist for:
 - config helpers
 - handler registration and polling update coverage
 - callback helper parsing
-- Google Sheets upsert/delete behavior
+- Google Sheets upsert/soft-remove/audit behavior
 - reconciliation helpers
 - runtime state persistence
 
@@ -260,20 +272,23 @@ python -m unittest discover -s tests
 - Join-request approvals can continue after restart because `chat_id` is persisted.
 - Pending-list callback buttons now preserve join-request vs member-update flow.
 - Google Sheets writes are now upserts by `User ID`.
-- Google Sheets sync operations now batch row updates and row deletes.
-- Google Sheets delete no longer hardcodes `sheetId = 0`.
+- Google Sheets sync operations now batch row updates and use soft-removal instead of deleting rows.
 - Added Bot API-based `/syncmembers` reconciliation for known sheet users.
 - Added concurrency-limited Telegram member lookups during Bot API sync.
 - Added retry and audit logging around Google Sheets writes.
 - Added configurable admin auto-add during `/syncmembers`.
 - Added optional Telethon-powered `/fullsyncmembers` for exact member backfill.
 - `/status` now uses the latest persisted snapshot by default, and `/statuslive` keeps the live-lookup path available.
+- Expanded the `Members` worksheet schema and added automatic `audit_logs` worksheet support.
+- Added real-time leave/kick audit handling from `chat_member` updates.
 - Added smoke tests for core flows and helpers.
 
 ## Known Gaps
 
 - The bot still cannot enumerate every Telegram group member directly with Bot API alone.
 - `/syncmembers` can fully verify known sheet users and current admins, but it still cannot backfill unknown non-admin group members that the bot has never seen.
+- `/status` may show cached snapshot data instead of live data when `STATUS_USE_CACHED_SNAPSHOT=true`.
+- Even with `/statuslive`, the Telegram group count can be exact while the sheet-derived in-group counts remain partial until a full sync or explicit tracking occurs.
 - `/fullsyncmembers` requires a separate authorized Telethon user session; it will not work with bot token credentials alone.
 - Runtime state persistence is local-file based only; there is no external shared state store for multi-instance deployments.
 - Command replies still primarily target `GROUP_CHAT_ID_FOR_ADMIN` instead of direct DM replies in all cases.
