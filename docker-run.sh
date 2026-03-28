@@ -12,6 +12,10 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+PROD_CONTAINER_NAME="tksignal-bot-prod"
+DEV_CONTAINER_NAME="tksignal-bot"
+PROD_ENV_FILE=".env.production"
+
 # Function to print colored output
 print_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
@@ -29,63 +33,114 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# Resolve which env file production should use
+set_prod_env_file() {
+    PROD_ENV_FILE=".env.production"
+    if [ ! -f "${PROD_ENV_FILE}" ]; then
+        PROD_ENV_FILE=".env"
+        return 1
+    fi
+    return 0
+}
+
 # Check if required files exist
 check_requirements() {
+    local env_file="$1"
+
     print_info "Checking requirements..."
-    
-    if [ ! -f ".env" ]; then
-        print_error ".env file not found!"
+
+    if [ ! -f "${env_file}" ]; then
+        print_error "${env_file} file not found!"
         exit 1
     fi
-    
+
     if [ ! -f "credentials.json" ]; then
         print_error "credentials.json file not found!"
         exit 1
     fi
-    
+
     if [ ! -f "requirements.txt" ]; then
         print_error "requirements.txt file not found!"
         exit 1
     fi
-    
+
     print_success "All required files found"
+}
+
+dev_compose() {
+    APP_ENV_FILE=".env" \
+    ENVIRONMENT="development" \
+    COMPOSE_CONTAINER_NAME="${DEV_CONTAINER_NAME}" \
+    COMPOSE_RESTART_POLICY="unless-stopped" \
+    COMPOSE_CPU_LIMIT="0.5" \
+    COMPOSE_MEMORY_LIMIT="512M" \
+    COMPOSE_CPU_RESERVATION="0.1" \
+    COMPOSE_MEMORY_RESERVATION="128M" \
+    COMPOSE_LOG_MAX_SIZE="10m" \
+    COMPOSE_LOG_MAX_FILE="3" \
+    COMPOSE_NETWORK_NAME="tksignal-network" \
+    docker compose "$@"
+}
+
+prod_compose() {
+    set_prod_env_file >/dev/null 2>&1 || true
+
+    APP_ENV_FILE="${PROD_ENV_FILE}" \
+    ENVIRONMENT="production" \
+    COMPOSE_CONTAINER_NAME="${PROD_CONTAINER_NAME}" \
+    COMPOSE_RESTART_POLICY="always" \
+    HEALTHCHECK_RETRIES="5" \
+    HEALTHCHECK_START_PERIOD="60s" \
+    COMPOSE_CPU_LIMIT="1.0" \
+    COMPOSE_MEMORY_LIMIT="1G" \
+    COMPOSE_CPU_RESERVATION="0.2" \
+    COMPOSE_MEMORY_RESERVATION="256M" \
+    COMPOSE_LOG_MAX_SIZE="50m" \
+    COMPOSE_LOG_MAX_FILE="5" \
+    COMPOSE_NETWORK_NAME="tksignal-prod-network" \
+    WATCHTOWER_CONTAINER_NAME="tksignal-watchtower" \
+    WATCHTOWER_TARGET_CONTAINER="${PROD_CONTAINER_NAME}" \
+    docker compose --profile production "$@"
+}
+
+is_prod_running() {
+    docker ps --format '{{.Names}}' | grep -qx "${PROD_CONTAINER_NAME}"
 }
 
 # Build the Docker image
 build() {
     print_info "Building Docker image..."
-    docker compose build --no-cache
+    dev_compose build --no-cache
     print_success "Docker image built successfully"
 }
 
 # Start the bot in development mode
 start_dev() {
-    check_requirements
+    check_requirements ".env"
     print_info "Starting TK-Signal Bot in development mode..."
-    docker compose up -d
+    dev_compose up -d
     print_success "Bot started successfully"
     print_info "Use 'docker compose logs -f' to view logs"
 }
 
 # Start the bot in production mode
 start_prod() {
-    check_requirements
-    if [ ! -f ".env.production" ]; then
+    if ! set_prod_env_file; then
         print_warning ".env.production not found, using .env"
-        cp .env .env.production
     fi
-    
+
+    check_requirements "${PROD_ENV_FILE}"
     print_info "Starting TK-Signal Bot in production mode..."
-    docker compose -f docker-compose.prod.yml up -d
+    prod_compose up -d
     print_success "Bot started successfully in production mode"
-    print_info "Use 'docker compose -f docker-compose.prod.yml logs -f' to view logs"
+    print_info "Use 'docker compose --profile production logs -f' to view logs"
 }
 
 # Stop the bot
 stop() {
     print_info "Stopping TK-Signal Bot..."
-    docker compose down
-    docker compose -f docker-compose.prod.yml down 2>/dev/null || true
+    dev_compose down 2>/dev/null || true
+    prod_compose down 2>/dev/null || true
     print_success "Bot stopped successfully"
 }
 
@@ -99,36 +154,48 @@ restart() {
 
 # View logs
 logs() {
-    if docker compose ps -q tksignal-bot-prod >/dev/null 2>&1; then
+    if is_prod_running; then
         print_info "Showing production logs..."
-        docker compose -f docker-compose.prod.yml logs -f
+        prod_compose logs -f
     else
         print_info "Showing development logs..."
-        docker compose logs -f
+        dev_compose logs -f
     fi
 }
 
 # Show status
 status() {
-    print_info "Container status:"
-    docker compose ps
-    docker compose -f docker-compose.prod.yml ps 2>/dev/null || true
+    print_info "Development status:"
+    dev_compose ps 2>/dev/null || true
+
+    print_info "Production status:"
+    prod_compose ps 2>/dev/null || true
 }
 
 # Update and restart
 update() {
     print_info "Updating TK-Signal Bot..."
+    local target_mode="dev"
+
+    if is_prod_running; then
+        target_mode="prod"
+    fi
+
     stop
     build
-    start_dev
+    if [ "${target_mode}" = "prod" ]; then
+        start_prod
+    else
+        start_dev
+    fi
     print_success "Bot updated and restarted"
 }
 
 # Clean up
 cleanup() {
     print_info "Cleaning up Docker resources..."
-    docker compose down --rmi all --volumes --remove-orphans
-    docker compose -f docker-compose.prod.yml down --rmi all --volumes --remove-orphans 2>/dev/null || true
+    dev_compose down --rmi all --volumes --remove-orphans 2>/dev/null || true
+    prod_compose down --rmi all --volumes --remove-orphans 2>/dev/null || true
     docker system prune -f
     print_success "Cleanup completed"
 }
@@ -150,6 +217,10 @@ show_help() {
     echo "  update      Update and restart bot"
     echo "  cleanup     Clean up all Docker resources"
     echo "  help        Show this help message"
+    echo ""
+    echo "Notes:"
+    echo "  - Uses a single docker-compose.yml for both development and production"
+    echo "  - Production mode reads .env.production when present, otherwise falls back to .env"
     echo ""
     echo "Examples:"
     echo "  $0 dev      # Start development environment"

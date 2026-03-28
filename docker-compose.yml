@@ -1,61 +1,75 @@
-
 services:
   tksignal-bot:
     build: .
-    container_name: tksignal-bot
-    restart: unless-stopped
-    
-    # Environment variables from .env file
+    container_name: ${COMPOSE_CONTAINER_NAME:-tksignal-bot}
+    restart: ${COMPOSE_RESTART_POLICY:-unless-stopped}
+
     env_file:
-      - .env
-    
-    # Additional environment variables
+      - ${APP_ENV_FILE:-.env}
+
     environment:
       - PYTHONUNBUFFERED=1
-      - TZ=Asia/Bangkok
-    
-    # Mount volumes
+      - PYTHONDONTWRITEBYTECODE=1
+      - TZ=${TZ:-Asia/Bangkok}
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+
     volumes:
-      - ./credentials.json:/app/credentials.json:ro  # Read-only Google credentials
-      - ./logs:/app/logs  # Log directory (optional)
-    
-    # Health check
+      - ./credentials.json:/app/credentials.json:ro
+      - ./logs:/app/logs
+
     healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('https://api.telegram.org/bot$$TELEGRAM_BOT_TOKEN/getMe')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-    
-    # Resource limits (optional)
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os, urllib.request; urllib.request.urlopen('https://api.telegram.org/bot' + os.environ['TELEGRAM_BOT_TOKEN'] + '/getMe')"
+        ]
+      interval: ${HEALTHCHECK_INTERVAL:-30s}
+      timeout: ${HEALTHCHECK_TIMEOUT:-10s}
+      retries: ${HEALTHCHECK_RETRIES:-3}
+      start_period: ${HEALTHCHECK_START_PERIOD:-40s}
+
     deploy:
       resources:
         limits:
-          cpus: '0.5'
-          memory: 512M
+          cpus: '${COMPOSE_CPU_LIMIT:-0.5}'
+          memory: ${COMPOSE_MEMORY_LIMIT:-512M}
         reservations:
-          cpus: '0.1'
-          memory: 128M
-    
-    # Logging configuration
+          cpus: '${COMPOSE_CPU_RESERVATION:-0.1}'
+          memory: ${COMPOSE_MEMORY_RESERVATION:-128M}
+
     logging:
       driver: "json-file"
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: "${COMPOSE_LOG_MAX_SIZE:-10m}"
+        max-file: "${COMPOSE_LOG_MAX_FILE:-3}"
 
-# Optional: Add a monitoring service
-  # watchtower:
-  #   image: containrrr/watchtower
-  #   container_name: watchtower
-  #   restart: unless-stopped
-  #   volumes:
-  #     - /var/run/docker.sock:/var/run/docker.sock
-  #   environment:
-  #     - WATCHTOWER_POLL_INTERVAL=3600  # Check every hour
-  #     - WATCHTOWER_CLEANUP=true
-  #   command: tksignal-bot
+    security_opt:
+      - no-new-privileges:true
+
+    tmpfs:
+      - /tmp
+
+  watchtower:
+    image: containrrr/watchtower
+    container_name: ${WATCHTOWER_CONTAINER_NAME:-tksignal-watchtower}
+    restart: unless-stopped
+    profiles: ["production"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_POLL_INTERVAL=${WATCHTOWER_POLL_INTERVAL:-86400}
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_INCLUDE_STOPPED=true
+      - WATCHTOWER_NOTIFICATIONS=${WATCHTOWER_NOTIFICATIONS:-email}
+      - WATCHTOWER_NOTIFICATION_EMAIL_FROM=${WATCHTOWER_NOTIFICATION_EMAIL_FROM:-noreply@yourdomain.com}
+      - WATCHTOWER_NOTIFICATION_EMAIL_TO=${WATCHTOWER_NOTIFICATION_EMAIL_TO:-admin@yourdomain.com}
+      - WATCHTOWER_NOTIFICATION_EMAIL_SERVER=${WATCHTOWER_NOTIFICATION_EMAIL_SERVER:-smtp.gmail.com}
+      - WATCHTOWER_NOTIFICATION_EMAIL_SERVER_PORT=${WATCHTOWER_NOTIFICATION_EMAIL_SERVER_PORT:-587}
+    command: ${WATCHTOWER_TARGET_CONTAINER:-tksignal-bot}
 
 networks:
   default:
-    name: tksignal-network
+    name: ${COMPOSE_NETWORK_NAME:-tksignal-network}
+    driver: bridge
