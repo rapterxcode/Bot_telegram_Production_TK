@@ -19,7 +19,7 @@ services:
     volumes:
       - ./credentials.json:/app/credentials.json:ro
       - ./logs:/app/logs
-      - ./data:/app/data
+      - tksignal-bot-data:/app/data
 
     healthcheck:
       test:
@@ -77,3 +77,7 @@ networks:
   default:
     name: ${COMPOSE_NETWORK_NAME:-tksignal-network}
     driver: bridge
+
+volumes:
+  tksignal-bot-data:
+    name: ${COMPOSE_DATA_VOLUME_NAME:-tksignal-bot-data}

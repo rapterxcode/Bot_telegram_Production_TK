@@ -86,7 +86,7 @@ requirements.txt
   - `runtime`: copies only the virtualenv and application source into a slimmer final image
 - The runtime image keeps the existing `python -m app.main` entrypoint and Telegram healthcheck.
 - The runtime image now creates `/app/logs` and `/app/data` for log/state/session files.
-- `docker-compose.yml` now builds the explicit `runtime` stage and mounts `./data:/app/data` so persisted state and Telethon session files survive container recreation.
+- `docker-compose.yml` now builds the explicit `runtime` stage and mounts a named Docker volume at `/app/data` so persisted state and Telethon session files survive container recreation without host bind-mount permission issues.
 
 ### Polling
 
@@ -281,7 +281,7 @@ python -m unittest discover -s tests
 - Polling `allowed_updates` is explicit for the events the bot relies on.
 - Runtime bot state survives restarts through local JSON persistence, and the path is now configurable.
 - Docker build now uses a multi-stage `builder` + `runtime` pattern and a Python 3.11 slim base image.
-- Docker Compose now persists `/app/data` to the host `./data` directory.
+- Docker Compose now persists `/app/data` in a named Docker volume.
 - Join-request approvals can continue after restart because `chat_id` is persisted.
 - Pending-list callback buttons now preserve join-request vs member-update flow.
 - Google Sheets writes are now upserts by `User ID`.
